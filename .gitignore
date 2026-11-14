@@ -1,0 +1,11 @@
+target/
+firmware/vvbook-x3-fw/target/
+firmware/vvbook-x3-ramprobe/target/
+sdcard/
+emu_sdcard/
+dist/
+backups/
+.venv/
+*.key
+*.secret
+.DS_Store

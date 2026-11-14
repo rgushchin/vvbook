@@ -1,0 +1,2 @@
+[target.riscv32imc-unknown-none-elf]
+linker = "ld.lld"

@@ -1,0 +1,10 @@
+[package]
+name = "vvbook-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vvbook-pal = { workspace = true }
+blake3 = { workspace = true }
+miniz_oxide = { workspace = true }

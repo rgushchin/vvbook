@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>VVDrop · Folio OS</title>
+<style>
+  :root {
+    --paper: #F6F4EE;
+    --card: #FFFFFF;
+    --ink: #181816;
+    --charcoal: #5C5A55;
+    --silver: #D4D1C9;
+  }
+  * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--paper); color: var(--ink);
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .shell {
+    width: 100%; max-width: 460px; background: var(--card);
+    border: 1.5px solid var(--ink); border-radius: 26px; padding: 30px;
+    box-shadow: 0 18px 40px rgba(24,24,22,0.08);
+  }
+  .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+  .brand { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+  .lang-btn {
+    border: 1px solid var(--ink); background: var(--paper); color: var(--ink);
+    border-radius: 999px; padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  .sub { color: var(--charcoal); font-size: 14px; line-height: 1.45; margin-bottom: 22px; }
+  label { display: block; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--charcoal); margin-bottom: 6px; font-weight: 600; }
+  input[type=text] {
+    width: 100%; padding: 14px 16px; border: 1.5px solid var(--silver); border-radius: 14px;
+    font-size: 24px; font-weight: 700; letter-spacing: 0.25em; text-align: center;
+    background: var(--paper); color: var(--ink); margin-bottom: 14px; outline: none;
+  }
+  input[type=text]:focus { border-color: var(--ink); }
+  .btn {
+    width: 100%; padding: 14px; border-radius: 14px; border: 1.5px solid var(--ink);
+    background: var(--ink); color: var(--paper); font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  .dropzone {
+    margin-top: 20px; border: 2px dashed var(--silver); border-radius: 18px;
+    padding: 30px 18px; text-align: center; cursor: pointer; transition: all 0.15s;
+    background: var(--paper);
+  }
+  .dropzone.drag { border-color: var(--ink); background: #ECE9E0; }
+  .dropzone strong { display: block; font-size: 15px; margin-bottom: 6px; }
+  .dropzone span { font-size: 12px; color: var(--charcoal); }
+  .status {
+    margin-top: 16px; padding: 12px 14px; border-radius: 12px; font-size: 13px;
+    background: var(--paper); border: 1px solid var(--silver); min-height: 42px;
+  }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="top">
+    <div class="brand">VVDrop</div>
+    <button class="lang-btn" id="langBtn" onclick="toggleLang()">Русский</button>
+  </div>
+  <div class="sub" id="subTxt">Connected to <b>VVBook-Folio</b>. Enter the 8-digit Access Key shown on your Xteink X3 display, then drop your books.</div>
+
+  <div id="pairBox">
+    <label id="pinLbl">Access Key</label>
+    <input id="pinIn" type="text" maxlength="10" inputmode="numeric" placeholder="0000 0000"/>
+    <button class="btn" id="pairBtn" onclick="pairDevice()">Pair Reader</button>
+  </div>
+
+  <div id="dropBox" class="dropzone hidden" onclick="document.getElementById('fileIn').click()">
+    <strong id="dropTitle">Drop book here or tap to browse</strong>
+    <span id="dropSub">.epub · .fb2 · .fb2.zip · .mobi · .azw3 · .md · .html · .txt · .vvb</span>
+    <input id="fileIn" type="file" multiple class="hidden" onchange="handleFiles(this.files)"/>
+  </div>
+
+  <div class="status" id="statusTxt">Waiting for 8-digit Access Key…</div>
+</div>
+<script>
+let lang = 'en';
+let token = '';
+const T = {
+  en: {
+    btn: 'Русский',
+    sub: 'Connected to <b>VVBook-Folio</b>. Enter the 8-digit Access Key shown on your Xteink X3 display, then drop your books.',
+    pinLbl: 'Access Key',
+    pairBtn: 'Pair Reader',
+    dropTitle: 'Drop book here or tap to browse',
+    wait: 'Waiting for 8-digit Access Key…',
+    paired: 'Paired cleanly. Drop your book(s) below.',
+    badPin: 'Wrong Access Key. Check your X3 screen.',
+    locked: 'Too many failed attempts. Refresh key on reader.',
+    sending: 'Sending ',
+    sent: 'Delivered cleanly to Folio Library: '
+  },
+  ru: {
+    btn: 'English',
+    sub: 'Подключено к <b>VVBook-Folio</b>. Введите 8-значный ключ доступа с экрана Xteink X3, затем выберите или перетащите книги.',
+    pinLbl: 'Ключ доступа',
+    pairBtn: 'Подключить книгу',
+    dropTitle: 'Перетащите файл сюда или нажмите',
+    wait: 'Ожидание 8-значного ключа доступа…',
+    paired: 'Подключено. Перетащите книги ниже.',
+    badPin: 'Неверный ключ доступа. Проверьте экран X3.',
+    locked: 'Превышен лимит попыток. Нажмите OK на книге.',
+    sending: 'Отправка ',
+    sent: 'Отправлено в библиотеку Folio: '
+  }
+};
+function applyLang() {
+  const s = T[lang];
+  document.getElementById('langBtn').textContent = s.btn;
+  document.getElementById('subTxt').innerHTML = s.sub;
+  document.getElementById('pinLbl').textContent = s.pinLbl;
+  document.getElementById('pairBtn').textContent = s.pairBtn;
+  document.getElementById('dropTitle').textContent = s.dropTitle;
+  if (!token) document.getElementById('statusTxt').textContent = s.wait;
+}
+function toggleLang() { lang = (lang === 'en' ? 'ru' : 'en'); applyLang(); }
+
+function randHex32() {
+  const b = new Uint8Array(32);
+  if (window.crypto && window.crypto.getRandomValues) {
+    window.crypto.getRandomValues(b);
+  } else {
+    for (let i = 0; i < 32; i++) b[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+function localStamp() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+         p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+async function pairDevice() {
+  const pin = document.getElementById('pinIn').value.replace(/[\s-]+/g, '');
+  const s = T[lang];
+  if (!/^\d{8}$/.test(pin)) { document.getElementById('statusTxt').textContent = s.badPin; return; }
+  const nr = await fetch('/api/nonce');
+  const nonceHex = (await nr.text()).trim();
+  const cnonce = randHex32();
+  const res = await fetch('/api/auth', {
+    method: 'POST',
+    headers: {
+      'X-VVDrop-Pin': pin,
+      'X-VVDrop-Client-Nonce': cnonce,
+      'X-VVDrop-Server-Nonce': nonceHex,
+      'X-VVDrop-Datetime': localStamp()
+    }
+  });
+  if (res.status === 423) { document.getElementById('statusTxt').textContent = s.locked; return; }
+  if (!res.ok) { document.getElementById('statusTxt').textContent = s.badPin; return; }
+  token = (await res.text()).trim();
+  document.getElementById('pairBox').classList.add('hidden');
+  document.getElementById('dropBox').classList.remove('hidden');
+  document.getElementById('statusTxt').textContent = s.paired;
+}
+
+const dz = document.getElementById('dropBox');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); handleFiles(e.dataTransfer.files); });
+
+function uploadOneFile(f, s) {
+  return new Promise(resolve => {
+    const st = document.getElementById('statusTxt');
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload', true);
+    xhr.setRequestHeader('X-VVDrop-Token', token);
+    xhr.setRequestHeader('X-VVDrop-Filename', encodeURIComponent(f.name));
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable && e.total > 0) {
+        const pct = Math.min(100, Math.round((e.loaded * 100) / e.total));
+        st.textContent = s.sending + f.name + ' (' + pct + '%)…';
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        st.textContent = s.sent + f.name;
+      } else {
+        st.textContent = 'Error HTTP ' + xhr.status + (xhr.responseText ? ': ' + xhr.responseText : '');
+      }
+      resolve();
+    };
+    xhr.onerror = () => {
+      st.textContent = 'Network error uploading ' + f.name;
+      resolve();
+    };
+    xhr.send(f);
+  });
+}
+
+async function handleFiles(files) {
+  const s = T[lang];
+  for (const f of files) {
+    document.getElementById('statusTxt').textContent = s.sending + f.name + '…';
+    await uploadOneFile(f, s);
+  }
+  document.getElementById('fileIn').value = '';
+}
+
+async function tryWpa2AutoPair() {
+  try {
+    const res = await fetch('/api/auth', {
+      method: 'POST',
+      headers: {
+        'X-VVDrop-Wpa2-Session': '1',
+        'X-VVDrop-Datetime': localStamp()
+      }
+    });
+    if (res.ok) {
+      token = (await res.text()).trim();
+      document.getElementById('pairBox').classList.add('hidden');
+      document.getElementById('dropBox').classList.remove('hidden');
+      document.getElementById('statusTxt').textContent = T[lang].paired;
+    }
+  } catch (_) {}
+}
+tryWpa2AutoPair();
+</script>
+</body>
+</html>

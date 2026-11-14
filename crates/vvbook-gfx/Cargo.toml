@@ -1,0 +1,8 @@
+[package]
+name = "vvbook-gfx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vvbook-pal = { workspace = true }

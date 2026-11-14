@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vvbook-pal",
+    "crates/vvbook-gfx",
+    "crates/vvbook-typeset",
+    "crates/vvbook-format",
+    "crates/vvbook-security",
+    "crates/vvbook-games",
+    "crates/vvbook-userspace",
+    "crates/vvbook-x3-hal",
+    "crates/vvbook-emu",
+    "crates/vvbook-cli",
+    "tools/vvbook-fontbake",
+    "tools/vvbook-espimage",
+]
+exclude = [
+    "firmware/vvbook-x3-fw",
+    "firmware/vvbook-x3-ramprobe",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["VVBook Contributors"]
+
+[workspace.dependencies]
+vvbook-pal = { path = "crates/vvbook-pal" }
+vvbook-gfx = { path = "crates/vvbook-gfx" }
+vvbook-typeset = { path = "crates/vvbook-typeset" }
+vvbook-format = { path = "crates/vvbook-format" }
+vvbook-security = { path = "crates/vvbook-security" }
+vvbook-games = { path = "crates/vvbook-games" }
+vvbook-userspace = { path = "crates/vvbook-userspace" }
+vvbook-x3-hal = { path = "crates/vvbook-x3-hal" }
+
+blake3 = { version = "1.8", default-features = false }
+ed25519-compact = { version = "2.6", default-features = false }
+smoltcp = { version = "0.12.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-udp", "socket-tcp"] }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+fontdue = "0.9"
+png = "0.18"
+lopdf = "0.47"
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland", "wayland-dlopen", "rwh_06"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }

@@ -1,0 +1,24 @@
+[package]
+name = "vvbook-emu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vvbook-pal = { workspace = true }
+vvbook-gfx = { workspace = true }
+vvbook-format = { workspace = true }
+vvbook-typeset = { workspace = true }
+vvbook-security = { workspace = true }
+vvbook-games = { workspace = true }
+vvbook-userspace = { workspace = true }
+vvbook-x3-hal = { workspace = true }
+blake3 = { workspace = true }
+miniz_oxide = { workspace = true }
+png = { workspace = true }
+winit = { workspace = true }
+softbuffer = { workspace = true }
+
+[dev-dependencies]
+vvbook-cli = { path = "../vvbook-cli" }
+lopdf = { workspace = true }

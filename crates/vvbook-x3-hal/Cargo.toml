@@ -1,0 +1,15 @@
+[package]
+name = "vvbook-x3-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vvbook-pal = { workspace = true }
+vvbook-security = { workspace = true }
+smoltcp = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+ed25519-compact = { workspace = true }
+smoltcp = { workspace = true, features = ["socket-dhcpv4", "socket-dns"] }

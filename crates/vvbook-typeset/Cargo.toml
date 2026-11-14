@@ -1,0 +1,10 @@
+[package]
+name = "vvbook-typeset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vvbook-pal = { workspace = true }
+vvbook-gfx = { workspace = true }
+vvbook-format = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "vvbook-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vvbook-pal = { workspace = true }
+vvbook-format = { workspace = true }
+vvbook-security = { workspace = true }
+blake3 = { workspace = true }
+ed25519-compact = { workspace = true }
+lopdf = { workspace = true }
+png = { workspace = true }
+miniz_oxide = { workspace = true }

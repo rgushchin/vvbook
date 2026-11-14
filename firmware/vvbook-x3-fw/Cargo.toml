@@ -1,0 +1,28 @@
+[package]
+name = "vvbook-x3-fw"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+vvbook-pal = { path = "../../crates/vvbook-pal" }
+vvbook-security = { path = "../../crates/vvbook-security" }
+vvbook-x3-hal = { path = "../../crates/vvbook-x3-hal" }
+vvbook-userspace = { path = "../../crates/vvbook-userspace" }
+esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"] }
+esp-alloc = "0.8.0"
+esp-wifi = { version = "=0.15.1", features = ["esp32c3", "wifi", "smoltcp", "builtin-scheduler"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp", "socket-tcp", "socket-raw"] }
+
+[profile.release]
+opt-level = "z"
+lto = false
+codegen-units = 1
+panic = "abort"
+strip = false
+
+[profile.release.package.esp-wifi]
+opt-level = 3
+
+[profile.dev.package.esp-wifi]
+opt-level = 3

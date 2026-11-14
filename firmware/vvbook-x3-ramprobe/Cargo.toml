@@ -1,0 +1,16 @@
+[package]
+name = "vvbook-x3-ramprobe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+vvbook-pal = { path = "../../crates/vvbook-pal" }
+vvbook-x3-hal = { path = "../../crates/vvbook-x3-hal" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false
