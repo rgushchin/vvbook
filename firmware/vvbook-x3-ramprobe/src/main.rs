@@ -296,80 +296,111 @@ const APB_SARADC_CLKM_CONF_REG: usize = 0x6004_0054;
 const USB_SERIAL_JTAG_EP1_REG: usize = 0x6004_3000;
 const USB_SERIAL_JTAG_EP1_CONF_REG: usize = 0x6004_3004;
 
+/// Read a 32-bit ESP32-C3 peripheral MMIO register at `addr`.
+///
+/// # Safety
+/// `addr` must be a valid, 4-byte-aligned ESP32-C3 peripheral register in
+/// `0x6000_0000..0x6010_0000` whose volatile read is valid for the current hardware state.
 #[inline]
-fn mmio_read(addr: usize) -> u32 {
+unsafe fn mmio_read(addr: usize) -> u32 {
+    debug_assert!(addr & 3 == 0 && (0x6000_0000..0x6010_0000).contains(&addr));
     unsafe { ptr::read_volatile(addr as *const u32) }
 }
 
+/// Write `val` to a 32-bit ESP32-C3 peripheral MMIO register at `addr`.
+///
+/// # Safety
+/// `addr` must be a valid, 4-byte-aligned ESP32-C3 peripheral register in
+/// `0x6000_0000..0x6010_0000` and `val` must preserve peripheral and memory safety invariants.
 #[inline]
-fn mmio_write(addr: usize, val: u32) {
+unsafe fn mmio_write(addr: usize, val: u32) {
+    debug_assert!(addr & 3 == 0 && (0x6000_0000..0x6010_0000).contains(&addr));
     unsafe { ptr::write_volatile(addr as *mut u32, val) }
 }
 
 fn disable_watchdogs() {
-    mmio_write(TIMG0_WDTWPROTECT, 0x50D8_3AA1);
-    mmio_write(TIMG0_WDTCONFIG0, 0);
-    mmio_write(TIMG1_WDTWPROTECT, 0x50D8_3AA1);
-    mmio_write(TIMG1_WDTCONFIG0, 0);
+    // SAFETY: Disabling TIMG0/TIMG1/RTC/SWD watchdogs uses documented WDT protect & config MMIO registers on single-core ESP32-C3.
+    unsafe {
+        mmio_write(TIMG0_WDTWPROTECT, 0x50D8_3AA1);
+        mmio_write(TIMG0_WDTCONFIG0, 0);
+        mmio_write(TIMG1_WDTWPROTECT, 0x50D8_3AA1);
+        mmio_write(TIMG1_WDTCONFIG0, 0);
 
-    mmio_write(RTC_CNTL_WDTWPROTECT, 0x50D8_3AA1);
-    mmio_write(RTC_CNTL_WDTCONFIG0, 0);
+        mmio_write(RTC_CNTL_WDTWPROTECT, 0x50D8_3AA1);
+        mmio_write(RTC_CNTL_WDTCONFIG0, 0);
 
-    mmio_write(RTC_CNTL_SWD_WPROTECT, 0x8F1D_312A);
-    let swd = mmio_read(RTC_CNTL_SWD_CONF);
-    mmio_write(RTC_CNTL_SWD_CONF, swd | (1 << 30));
+        mmio_write(RTC_CNTL_SWD_WPROTECT, 0x8F1D_312A);
+        let swd = mmio_read(RTC_CNTL_SWD_CONF);
+        mmio_write(RTC_CNTL_SWD_CONF, swd | (1 << 30));
+    }
 }
 
 fn enable_periph_clocks() {
     let bits0 = (1 << 6) | (1 << 7) | (1 << 28); // SPI2 | I2C_EXT0 | APB_SARADC
-    mmio_write(SYSTEM_PERIP_CLK_EN0_REG, mmio_read(SYSTEM_PERIP_CLK_EN0_REG) | bits0);
-    mmio_write(SYSTEM_PERIP_RST_EN0_REG, mmio_read(SYSTEM_PERIP_RST_EN0_REG) | bits0);
-    mmio_write(SYSTEM_PERIP_RST_EN0_REG, mmio_read(SYSTEM_PERIP_RST_EN0_REG) & !bits0);
-
     let bits1 = 1 << 10; // TSENS / SARADC analog clock gate
-    mmio_write(SYSTEM_PERIP_CLK_EN1_REG, mmio_read(SYSTEM_PERIP_CLK_EN1_REG) | bits1);
-    mmio_write(SYSTEM_PERIP_RST_EN1_REG, mmio_read(SYSTEM_PERIP_RST_EN1_REG) | bits1);
-    mmio_write(SYSTEM_PERIP_RST_EN1_REG, mmio_read(SYSTEM_PERIP_RST_EN1_REG) & !bits1);
+    // SAFETY: SYSTEM_PERIP_* registers are valid ESP32-C3 clock/reset MMIO registers.
+    unsafe {
+        mmio_write(SYSTEM_PERIP_CLK_EN0_REG, mmio_read(SYSTEM_PERIP_CLK_EN0_REG) | bits0);
+        mmio_write(SYSTEM_PERIP_RST_EN0_REG, mmio_read(SYSTEM_PERIP_RST_EN0_REG) | bits0);
+        mmio_write(SYSTEM_PERIP_RST_EN0_REG, mmio_read(SYSTEM_PERIP_RST_EN0_REG) & !bits0);
+
+        mmio_write(SYSTEM_PERIP_CLK_EN1_REG, mmio_read(SYSTEM_PERIP_CLK_EN1_REG) | bits1);
+        mmio_write(SYSTEM_PERIP_RST_EN1_REG, mmio_read(SYSTEM_PERIP_RST_EN1_REG) | bits1);
+        mmio_write(SYSTEM_PERIP_RST_EN1_REG, mmio_read(SYSTEM_PERIP_RST_EN1_REG) & !bits1);
+    }
 }
 
 fn gpio_config_output(pin: u8, initial_high: bool) {
-    mmio_write(IO_MUX_GPIO_BASE + usize::from(pin) * 4, (1 << 9) | (1 << 12));
-    mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(pin) * 4, 128);
-    if initial_high {
-        mmio_write(GPIO_OUT_W1TS_REG, 1 << pin);
-    } else {
-        mmio_write(GPIO_OUT_W1TC_REG, 1 << pin);
+    // SAFETY: IO_MUX_GPIOx and GPIO_* registers are valid for valid ESP32-C3 GPIO pin indices.
+    unsafe {
+        mmio_write(IO_MUX_GPIO_BASE + usize::from(pin) * 4, (1 << 9) | (1 << 12));
+        mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(pin) * 4, 128);
+        if initial_high {
+            mmio_write(GPIO_OUT_W1TS_REG, 1 << pin);
+        } else {
+            mmio_write(GPIO_OUT_W1TC_REG, 1 << pin);
+        }
+        mmio_write(GPIO_ENABLE_W1TS_REG, 1 << pin);
     }
-    mmio_write(GPIO_ENABLE_W1TS_REG, 1 << pin);
 }
 
 fn gpio_config_input(pin: u8, pull_up: bool) {
-    mmio_write(GPIO_ENABLE_W1TC_REG, 1 << pin);
     let mut mux = (1 << 9) | (1 << 12); // FUN_IE | MCU_SEL=GPIO
     if pull_up {
         mux |= 1 << 8; // FUN_WPU
     }
-    mmio_write(IO_MUX_GPIO_BASE + usize::from(pin) * 4, mux);
+    // SAFETY: Valid GPIO/IO_MUX MMIO registers for input pin configuration.
+    unsafe {
+        mmio_write(GPIO_ENABLE_W1TC_REG, 1 << pin);
+        mmio_write(IO_MUX_GPIO_BASE + usize::from(pin) * 4, mux);
+    }
 }
 
 fn gpio_config_analog(pin: u8) {
-    mmio_write(GPIO_ENABLE_W1TC_REG, 1 << pin);
-    // MCU_SEL = 1 only: NO FUN_WPU, NO FUN_IE so resistor ladders read cleanly
-    mmio_write(IO_MUX_GPIO_BASE + usize::from(pin) * 4, 1 << 12);
+    // SAFETY: Valid GPIO/IO_MUX MMIO registers for analog pin isolation.
+    unsafe {
+        mmio_write(GPIO_ENABLE_W1TC_REG, 1 << pin);
+        // MCU_SEL = 1 only: NO FUN_WPU, NO FUN_IE so resistor ladders read cleanly
+        mmio_write(IO_MUX_GPIO_BASE + usize::from(pin) * 4, 1 << 12);
+    }
 }
 
 #[inline]
 fn gpio_set(pin: u8, high: bool) {
-    if high {
-        mmio_write(GPIO_OUT_W1TS_REG, 1 << pin);
-    } else {
-        mmio_write(GPIO_OUT_W1TC_REG, 1 << pin);
+    // SAFETY: GPIO_OUT_W1TS/W1TC are write-one-to-set/clear MMIO registers.
+    unsafe {
+        if high {
+            mmio_write(GPIO_OUT_W1TS_REG, 1 << pin);
+        } else {
+            mmio_write(GPIO_OUT_W1TC_REG, 1 << pin);
+        }
     }
 }
 
 #[inline]
 fn gpio_get(pin: u8) -> bool {
-    (mmio_read(GPIO_IN_REG) & (1 << pin)) != 0
+    // SAFETY: GPIO_IN_REG is a read-only GPIO level MMIO register.
+    (unsafe { mmio_read(GPIO_IN_REG) } & (1 << pin)) != 0
 }
 
 #[derive(Clone, Copy)]
@@ -377,19 +408,23 @@ struct EspSysTimer;
 
 impl EspSysTimer {
     fn init() {
-        mmio_write(SYSTIMER_CONF_REG, (1 << 30) | (1 << 31));
+        // SAFETY: SYSTIMER_CONF_REG enables unit0 clock and core stall mirror.
+        unsafe { mmio_write(SYSTIMER_CONF_REG, (1 << 30) | (1 << 31)) };
     }
 
     fn now_us() -> u64 {
-        mmio_write(SYSTIMER_UNIT0_OP_REG, 1 << 30);
-        for _ in 0..1_000 {
-            if (mmio_read(SYSTIMER_UNIT0_OP_REG) & (1 << 29)) != 0 {
-                break;
+        // SAFETY: SYSTIMER_UNIT0_* MMIO registers latch and read the 52-bit 16 MHz counter.
+        unsafe {
+            mmio_write(SYSTIMER_UNIT0_OP_REG, 1 << 30);
+            for _ in 0..1_000 {
+                if (mmio_read(SYSTIMER_UNIT0_OP_REG) & (1 << 29)) != 0 {
+                    break;
+                }
             }
+            let hi = u64::from(mmio_read(SYSTIMER_UNIT0_VALUE_HI) & 0xFFFFF);
+            let lo = u64::from(mmio_read(SYSTIMER_UNIT0_VALUE_LO));
+            ((hi << 32) | lo) / 16
         }
-        let hi = u64::from(mmio_read(SYSTIMER_UNIT0_VALUE_HI) & 0xFFFFF);
-        let lo = u64::from(mmio_read(SYSTIMER_UNIT0_VALUE_LO));
-        ((hi << 32) | lo) / 16
     }
 
     fn now_ms() -> u64 {
@@ -412,18 +447,22 @@ struct UsbSerialLog;
 impl UsbSerialLog {
     fn write_byte(b: u8) {
         for _ in 0..4_000 {
-            if (mmio_read(USB_SERIAL_JTAG_EP1_CONF_REG) & 2) != 0 {
-                mmio_write(USB_SERIAL_JTAG_EP1_REG, u32::from(b));
-                if b == b'\n' {
-                    mmio_write(USB_SERIAL_JTAG_EP1_CONF_REG, 1);
+            // SAFETY: USB_SERIAL_JTAG_EP1* are valid MMIO registers on ESP32-C3.
+            unsafe {
+                if (mmio_read(USB_SERIAL_JTAG_EP1_CONF_REG) & 2) != 0 {
+                    mmio_write(USB_SERIAL_JTAG_EP1_REG, u32::from(b));
+                    if b == b'\n' {
+                        mmio_write(USB_SERIAL_JTAG_EP1_CONF_REG, 1);
+                    }
+                    return;
                 }
-                return;
             }
         }
     }
 
     fn flush() {
-        mmio_write(USB_SERIAL_JTAG_EP1_CONF_REG, 1);
+        // SAFETY: Valid USB Serial/JTAG TX flush control register write.
+        unsafe { mmio_write(USB_SERIAL_JTAG_EP1_CONF_REG, 1) };
     }
 }
 
@@ -451,10 +490,13 @@ macro_rules! ulog {
 // ============================================================================
 
 fn spi2_update_cmd() {
-    mmio_write(SPI2_CMD_REG, mmio_read(SPI2_CMD_REG) | (1 << 23));
-    for _ in 0..200_000 {
-        if (mmio_read(SPI2_CMD_REG) & (1 << 23)) == 0 {
-            break;
+    // SAFETY: SPI2_CMD_REG bit 23 updates clock/user registers cleanly while idle.
+    unsafe {
+        mmio_write(SPI2_CMD_REG, mmio_read(SPI2_CMD_REG) | (1 << 23));
+        for _ in 0..200_000 {
+            if (mmio_read(SPI2_CMD_REG) & (1 << 23)) == 0 {
+                break;
+            }
         }
     }
 }
@@ -467,7 +509,8 @@ fn spi2_apply_freq_hz(hz: u32) {
     let n = n_div - 1;
     let h = (n_div / 2) - 1;
     let l = n;
-    mmio_write(SPI2_CLOCK_REG, (pre << 18) | (n << 12) | (h << 6) | l);
+    // SAFETY: SPI2_CLOCK_REG is a valid SPI2 peripheral MMIO register.
+    unsafe { mmio_write(SPI2_CLOCK_REG, (pre << 18) | (n << 12) | (h << 6) | l) };
     spi2_update_cmd();
 }
 
@@ -478,19 +521,22 @@ impl Esp32Spi2 {
         gpio_config_output(SPI_SCLK, false);
         gpio_config_output(SPI_MOSI, false);
         gpio_config_input(SPI_MISO, true);
-        mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_SCLK) * 4, 63);
-        mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_MOSI) * 4, 65);
-        mmio_write(GPIO_FUNC_IN_SEL_CFG_BASE + 64 * 4, (1 << 6) | u32::from(SPI_MISO));
+        // SAFETY: GPIO matrix and SPI2 registers are valid ESP32-C3 MMIO addresses.
+        unsafe {
+            mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_SCLK) * 4, 63);
+            mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_MOSI) * 4, 65);
+            mmio_write(GPIO_FUNC_IN_SEL_CFG_BASE + 64 * 4, (1 << 6) | u32::from(SPI_MISO));
 
-        mmio_write(SPI2_DMA_CONF_REG, 0);
-        mmio_write(SPI2_MISC_REG, 0);
-        mmio_write(SPI2_CTRL_REG, 0);
-        mmio_write(SPI2_USER1_REG, 0);
-        mmio_write(SPI2_SLAVE_REG, 0);
-        mmio_write(SPI2_SLAVE_REG, (1 << 29) | (1 << 30));
-        mmio_write(SPI2_SLAVE_REG, 0);
-        mmio_write(SPI2_CLK_GATE_REG, 0x07); // CLK_EN | MST_CLK_ACTIVE | MST_CLK_SEL(80MHz)
-        mmio_write(SPI2_USER_REG, (1 << 27) | (1 << 28) | 1); // USR_MOSI | USR_MISO | DOUTDIN
+            mmio_write(SPI2_DMA_CONF_REG, 0);
+            mmio_write(SPI2_MISC_REG, 0);
+            mmio_write(SPI2_CTRL_REG, 0);
+            mmio_write(SPI2_USER1_REG, 0);
+            mmio_write(SPI2_SLAVE_REG, 0);
+            mmio_write(SPI2_SLAVE_REG, (1 << 29) | (1 << 30));
+            mmio_write(SPI2_SLAVE_REG, 0);
+            mmio_write(SPI2_CLK_GATE_REG, 0x07); // CLK_EN | MST_CLK_ACTIVE | MST_CLK_SEL(80MHz)
+            mmio_write(SPI2_USER_REG, (1 << 27) | (1 << 28) | 1); // USR_MOSI | USR_MISO | DOUTDIN
+        }
         spi2_apply_freq_hz(400_000);
         Self
     }
@@ -500,36 +546,39 @@ impl Esp32Spi2 {
         if len == 0 {
             return;
         }
-        for i in 0..16 {
-            let base = i * 4;
-            if base >= len {
-                break;
-            }
-            let b0 = u32::from(*tx.get(base).unwrap_or(&0xFF));
-            let b1 = u32::from(*tx.get(base + 1).unwrap_or(&0xFF));
-            let b2 = u32::from(*tx.get(base + 2).unwrap_or(&0xFF));
-            let b3 = u32::from(*tx.get(base + 3).unwrap_or(&0xFF));
-            mmio_write(SPI2_W0_REG + base, b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
-        }
-        mmio_write(SPI2_MS_DLEN_REG, (len as u32 * 8) - 1);
-        spi2_update_cmd();
-        mmio_write(SPI2_CMD_REG, mmio_read(SPI2_CMD_REG) | (1 << 24));
-        for _ in 0..200_000 {
-            if (mmio_read(SPI2_CMD_REG) & (1 << 24)) == 0 {
-                break;
-            }
-        }
-
-        if !rx.is_empty() {
+        // SAFETY: `base < 64` keeps `SPI2_W0_REG + base` inside SPI2's 16-word FIFO (`W0..W15`).
+        unsafe {
             for i in 0..16 {
                 let base = i * 4;
-                if base >= rx.len() {
+                if base >= len {
                     break;
                 }
-                let word = mmio_read(SPI2_W0_REG + base);
-                for k in 0..4 {
-                    if let Some(dst) = rx.get_mut(base + k) {
-                        *dst = ((word >> (k * 8)) & 0xFF) as u8;
+                let b0 = u32::from(*tx.get(base).unwrap_or(&0xFF));
+                let b1 = u32::from(*tx.get(base + 1).unwrap_or(&0xFF));
+                let b2 = u32::from(*tx.get(base + 2).unwrap_or(&0xFF));
+                let b3 = u32::from(*tx.get(base + 3).unwrap_or(&0xFF));
+                mmio_write(SPI2_W0_REG + base, b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+            mmio_write(SPI2_MS_DLEN_REG, (len as u32 * 8) - 1);
+            spi2_update_cmd();
+            mmio_write(SPI2_CMD_REG, mmio_read(SPI2_CMD_REG) | (1 << 24));
+            for _ in 0..200_000 {
+                if (mmio_read(SPI2_CMD_REG) & (1 << 24)) == 0 {
+                    break;
+                }
+            }
+
+            if !rx.is_empty() {
+                for i in 0..16 {
+                    let base = i * 4;
+                    if base >= rx.len() {
+                        break;
+                    }
+                    let word = mmio_read(SPI2_W0_REG + base);
+                    for k in 0..4 {
+                        if let Some(dst) = rx.get_mut(base + k) {
+                            *dst = ((word >> (k * 8)) & 0xFF) as u8;
+                        }
                     }
                 }
             }
@@ -634,8 +683,11 @@ impl EpdPins for EspEpdPins {
         }
         gpio_set(EPD_CS, true);
         gpio_config_output(SPI_MOSI, false);
-        mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_SCLK) * 4, 63);
-        mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_MOSI) * 4, 65);
+        // SAFETY: Restore GPIO matrix SPI2 SCLK/MOSI signal routing after 3-wire read.
+        unsafe {
+            mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_SCLK) * 4, 63);
+            mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(SPI_MOSI) * 4, 65);
+        }
         self.last_0x70 = out;
         out
     }
@@ -659,14 +711,17 @@ struct BitBangI2c;
 impl BitBangI2c {
     fn init() -> Self {
         for pin in [I2C_SDA, I2C_SCL] {
-            mmio_write(
-                IO_MUX_GPIO_BASE + usize::from(pin) * 4,
-                (1 << 8) | (1 << 9) | (1 << 12),
-            );
-            mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(pin) * 4, 128);
-            mmio_write(GPIO_PIN0_REG + usize::from(pin) * 4, 1 << 2); // PAD_DRIVER open-drain
-            mmio_write(GPIO_OUT_W1TS_REG, 1 << pin);
-            mmio_write(GPIO_ENABLE_W1TS_REG, 1 << pin);
+            // SAFETY: Valid IO_MUX and GPIO open-drain configuration registers for I2C pins.
+            unsafe {
+                mmio_write(
+                    IO_MUX_GPIO_BASE + usize::from(pin) * 4,
+                    (1 << 8) | (1 << 9) | (1 << 12),
+                );
+                mmio_write(GPIO_FUNC_OUT_SEL_CFG_BASE + usize::from(pin) * 4, 128);
+                mmio_write(GPIO_PIN0_REG + usize::from(pin) * 4, 1 << 2); // PAD_DRIVER open-drain
+                mmio_write(GPIO_OUT_W1TS_REG, 1 << pin);
+                mmio_write(GPIO_ENABLE_W1TS_REG, 1 << pin);
+            }
         }
         // 9-clock bus recovery + STOP
         for _ in 0..9 {
@@ -790,40 +845,51 @@ impl I2cBus for BitBangI2c {
 }
 
 fn regi2c_saradc_write_mask(reg: u8, msb: u8, lsb: u8, data: u8) {
-    mmio_write(ANA_CONF0_REG, mmio_read(ANA_CONF0_REG) & !(1 << 18));
-    mmio_write(ANA_CONF1_REG, mmio_read(ANA_CONF1_REG) | (1 << 16));
-    let saved_gate = mmio_read(REGI2C_CLK_GATE_REG);
-    mmio_write(REGI2C_CLK_GATE_REG, 4);
+    // SAFETY: Analog PLL / REGI2C clock gate registers are valid ESP32-C3 MMIO addresses.
+    let saved_gate = unsafe {
+        mmio_write(ANA_CONF0_REG, mmio_read(ANA_CONF0_REG) & !(1 << 18));
+        mmio_write(ANA_CONF1_REG, mmio_read(ANA_CONF1_REG) | (1 << 16));
+        let saved_gate = mmio_read(REGI2C_CLK_GATE_REG);
+        mmio_write(REGI2C_CLK_GATE_REG, 4);
+        saved_gate
+    };
     let rom_fn: extern "C" fn(u8, u8, u8, u8, u8, u8) =
         unsafe { core::mem::transmute(ROM_I2C_WRITEREG_MASK) };
     rom_fn(0x69, 0, reg, msb, lsb, data);
-    mmio_write(REGI2C_CLK_GATE_REG, saved_gate);
+    // SAFETY: Restores previous REGI2C clock gate register state.
+    unsafe { mmio_write(REGI2C_CLK_GATE_REG, saved_gate) };
 }
 
 fn adc1_oneshot_raw_cfg(cfg: u32) -> u16 {
-    mmio_write(APB_SARADC_INT_CLR, 1 << 31);
-    mmio_write(APB_SARADC_ONETIME_SAMPLE, cfg);
-    EspSysTimer.delay_us(5);
-    mmio_write(APB_SARADC_ONETIME_SAMPLE, cfg | (1 << 29));
-    for _ in 0..20_000 {
-        if (mmio_read(APB_SARADC_INT_RAW) & (1 << 31)) != 0 {
-            break;
+    // SAFETY: APB_SARADC_* registers are valid SAR ADC1 MMIO registers after clock enable.
+    unsafe {
+        mmio_write(APB_SARADC_INT_CLR, 1 << 31);
+        mmio_write(APB_SARADC_ONETIME_SAMPLE, cfg);
+        EspSysTimer.delay_us(5);
+        mmio_write(APB_SARADC_ONETIME_SAMPLE, cfg | (1 << 29));
+        for _ in 0..20_000 {
+            if (mmio_read(APB_SARADC_INT_RAW) & (1 << 31)) != 0 {
+                break;
+            }
         }
+        let val = (mmio_read(APB_SARADC_1_DATA_STATUS) & 0x0FFF) as u16;
+        mmio_write(APB_SARADC_ONETIME_SAMPLE, cfg);
+        val
     }
-    let val = (mmio_read(APB_SARADC_1_DATA_STATUS) & 0x0FFF) as u16;
-    mmio_write(APB_SARADC_ONETIME_SAMPLE, cfg);
-    val
 }
 
 fn init_adc1() -> u16 {
-    let sens = mmio_read(RTC_CNTL_SENSOR_CTRL_REG) & 0x07FF_FFFF;
-    mmio_write(RTC_CNTL_SENSOR_CTRL_REG, sens | (4 << 27));
-    mmio_write(
-        APB_SARADC_CTRL_REG,
-        mmio_read(APB_SARADC_CTRL_REG) | (1 << 6) | (3 << 27),
-    );
-    let clkm = mmio_read(APB_SARADC_CLKM_CONF_REG) & !((3 << 21) | 0xFF);
-    mmio_write(APB_SARADC_CLKM_CONF_REG, clkm | (2 << 21) | (1 << 20) | 4);
+    // SAFETY: RTC_CNTL_SENSOR_CTRL_REG and APB_SARADC_* registers are valid ESP32-C3 MMIO addresses.
+    unsafe {
+        let sens = mmio_read(RTC_CNTL_SENSOR_CTRL_REG) & 0x07FF_FFFF;
+        mmio_write(RTC_CNTL_SENSOR_CTRL_REG, sens | (4 << 27));
+        mmio_write(
+            APB_SARADC_CTRL_REG,
+            mmio_read(APB_SARADC_CTRL_REG) | (1 << 6) | (3 << 27),
+        );
+        let clkm = mmio_read(APB_SARADC_CLKM_CONF_REG) & !((3 << 21) | 0xFF);
+        mmio_write(APB_SARADC_CLKM_CONF_REG, clkm | (2 << 21) | (1 << 20) | 4);
+    }
     regi2c_saradc_write_mask(6, 3, 0, 0x0F); // I2C_SARADC_DREF = 15
     EspSysTimer.delay_us(300);
 
@@ -1064,10 +1130,13 @@ pub extern "C" fn rust_main() -> ! {
     enable_periph_clocks();
 
     let clear_hold = (1 << EPD_RST) | (1 << SD_POWER_EN) | (1 << PWR_BTN);
-    mmio_write(
-        RTC_CNTL_DIG_PAD_HOLD_REG,
-        mmio_read(RTC_CNTL_DIG_PAD_HOLD_REG) & !clear_hold,
-    );
+    // SAFETY: Clears RTC digital pad hold bits for awake peripheral GPIOs.
+    unsafe {
+        mmio_write(
+            RTC_CNTL_DIG_PAD_HOLD_REG,
+            mmio_read(RTC_CNTL_DIG_PAD_HOLD_REG) & !clear_hold,
+        );
+    }
 
     gpio_config_output(SD_POWER_EN, false);
     gpio_config_output(SD_CS, true);

@@ -14,6 +14,9 @@ pub struct AdcButtonDecoder {
     long_emitted: bool,
     pending: Option<Button>,
     pending_since_ms: u64,
+    suppress_until_release: bool,
+    quiet_until_ms: u64,
+    release_bounce_ms: u64,
 }
 
 impl Default for AdcButtonDecoder {
@@ -31,6 +34,9 @@ impl AdcButtonDecoder {
             long_emitted: false,
             pending: None,
             pending_since_ms: 0,
+            suppress_until_release: false,
+            quiet_until_ms: 0,
+            release_bounce_ms: 0,
         }
     }
 
@@ -87,6 +93,20 @@ impl AdcButtonDecoder {
         }
     }
 
+    /// Swallows any currently held button until it debounces cleanly back to idle (`None`)
+    /// and suppresses new presses/bounces until at least `now_ms + min_settle_ms`.
+    pub fn suppress_until_idle(&mut self, now_ms: u64, min_settle_ms: u64) {
+        if self.stable.is_some() || self.pending.is_some() {
+            self.suppress_until_release = true;
+        }
+        self.stable = None;
+        self.pending = None;
+        self.pending_since_ms = now_ms;
+        self.long_emitted = true;
+        self.release_bounce_ms = min_settle_ms.min(80);
+        self.quiet_until_ms = self.quiet_until_ms.max(now_ms.saturating_add(min_settle_ms));
+    }
+
     /// Samples current ADC voltages and appends debounced `Press`, `LongPress`, and `Release`
     /// transitions into `out`.
     pub fn poll_into(
@@ -98,6 +118,44 @@ impl AdcButtonDecoder {
         out: &mut Vec<InputEvent>,
     ) {
         let raw = self.classify_raw(mv_a, mv_b, pwr_pressed);
+
+        if self.suppress_until_release {
+            if raw.is_some() {
+                self.pending = raw;
+                self.pending_since_ms = now_ms;
+                if self.release_bounce_ms > 0 {
+                    self.quiet_until_ms = self
+                        .quiet_until_ms
+                        .max(now_ms.saturating_add(self.release_bounce_ms));
+                }
+                return;
+            }
+            if self.pending.is_some() {
+                self.pending = None;
+                self.pending_since_ms = now_ms;
+                return;
+            }
+            if now_ms.saturating_sub(self.pending_since_ms) < DEBOUNCE_MS {
+                return;
+            }
+            self.suppress_until_release = false;
+            self.stable = None;
+            self.long_emitted = false;
+            return;
+        }
+
+        if now_ms < self.quiet_until_ms {
+            if raw.is_some() {
+                self.suppress_until_release = true;
+                self.pending = raw;
+                self.pending_since_ms = now_ms;
+            } else {
+                self.pending = None;
+                self.pending_since_ms = now_ms;
+            }
+            return;
+        }
+
         if raw != self.pending {
             self.pending = raw;
             self.pending_since_ms = now_ms;
@@ -107,11 +165,18 @@ impl AdcButtonDecoder {
         if raw != self.stable && now_ms.saturating_sub(self.pending_since_ms) >= DEBOUNCE_MS {
             if let Some(prev) = self.stable {
                 out.push(InputEvent::Release(prev));
-            }
-            self.stable = raw;
-            self.stable_since_ms = now_ms;
-            self.long_emitted = false;
-            if let Some(next) = raw {
+                self.stable = None;
+                self.long_emitted = false;
+                if raw.is_some() {
+                    // Direct button-to-button slew on shared ADC resistor ladder:
+                    // require clean return to idle (`None`) before accepting a new press.
+                    self.suppress_until_release = true;
+                    self.release_bounce_ms = 0;
+                }
+            } else if let Some(next) = raw {
+                self.stable = Some(next);
+                self.stable_since_ms = now_ms;
+                self.long_emitted = false;
                 out.push(InputEvent::Press(next));
             }
         } else if let Some(held) = self.stable
@@ -121,6 +186,12 @@ impl AdcButtonDecoder {
             self.long_emitted = true;
             out.push(InputEvent::LongPress(held));
         }
+    }
+
+    /// Returns `true` as soon as a raw button voltage dip is detected (even before
+    /// the 14 ms debounce completes) and for as long as a button remains held.
+    pub fn has_active_or_pending(&self) -> bool {
+        self.pending.is_some() || self.stable.is_some()
     }
 
     /// Convenience single-event poller when only one transition per poll matters.

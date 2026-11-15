@@ -462,4 +462,21 @@ mod tests {
         assert_eq!(range.len(), 5);
         assert_eq!(range[3], reopened.read_block(&store, "/many.vvb", 4097).unwrap());
     }
+
+    #[test]
+    fn vvb_binary_decoders_reject_overflow_and_huge_lengths() {
+        // count = 0x2AAA_AAAB overflows `8 + count * 6` on 32-bit targets (would wrap to 10 bytes).
+        let mut raw_vvlc = Vec::from(*b"VVLC");
+        raw_vvlc.extend_from_slice(&0x2AAA_AAABu32.to_le_bytes());
+        raw_vvlc.extend_from_slice(&[0u8; 2]);
+        assert_eq!(decode_layout_cache(&raw_vvlc), Err(vvb::VvbError::Truncated));
+
+        // Corrupt id_hex string length = u32::MAX right after a valid 44-byte VVBK preamble.
+        let mut bad_vvb = vec![0u8; 64];
+        bad_vvb[0..4].copy_from_slice(b"VVBK");
+        bad_vvb[4..6].copy_from_slice(&1u16.to_le_bytes());
+        bad_vvb[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(VvbBook::from_bytes(&bad_vvb).err(), Some(vvb::VvbError::Truncated));
+        assert_eq!(VvbIndex::from_header_bytes(&bad_vvb).err(), Some(vvb::VvbError::Truncated));
+    }
 }

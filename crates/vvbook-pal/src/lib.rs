@@ -185,6 +185,13 @@ pub struct PortalStatus {
     pub busy_message: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagedOta {
+    pub fw_version: u32,
+    pub payload_len: u32,
+    pub payload_blake3: [u8; 32],
+}
+
 pub trait NetworkPortal {
     fn start(&mut self, pin: &str);
     fn stop(&mut self);
@@ -205,6 +212,11 @@ pub trait NetworkPortal {
 
     /// Take an updated wall-clock timestamp received from a paired client browser.
     fn take_synced_datetime(&mut self) -> Option<DateTime> {
+        None
+    }
+
+    /// Take metadata for a signed `.vvfw` image verified and staged via OTA.
+    fn take_staged_ota(&mut self) -> Option<StagedOta> {
         None
     }
 }

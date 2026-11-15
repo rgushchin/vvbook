@@ -8,7 +8,11 @@ use vvbook_format::InputFormat;
 use vvbook_pal::{
     BatteryStatus, Button, DateTime, DeviceSensors, DisplaySink, EntropySource, InputEvent,
     NetworkPortal, PORTRAIT_H, PORTRAIT_W, PortalStatus, PowerControl, ROW_2BPP_BYTES, RefreshMode,
-    StorageBackend, StorageError,
+    StagedOta, StorageBackend, StorageError,
+};
+use vvbook_security::{
+    Blake3Drbg, Esp32c3ImageValidator, FOLIO_RELEASE_PUBKEY, MAX_ESP32C3_OTA_BYTES, NorFlashRegion,
+    PersistentSecurityState, SECURITY_SECTOR_SIZE, constant_time_eq,
 };
 use vvbook_userspace::{FolioApp, ReaderOverlay, Screen};
 use vvbook_x3_hal::epd::{X3EpdPlanes, portrait_to_native};
@@ -16,8 +20,8 @@ use vvbook_x3_hal::net_portal::{AP_SSID, AP_URL, StreamingHttpConn, VvDropServer
 use vvbook_x3_hal::pins::{BQ27220_I2C_ADDR, DS3231_I2C_ADDR, QMI8658_I2C_ADDR};
 use vvbook_x3_hal::sd_fat32::{BlockDevice, Fat32Volume, format_fat32};
 use vvbook_x3_hal::{
-    AdcButtonDecoder, Bq27220, DelayUs, Ds3231, EpdPins, HalError, I2cBus, Qmi8658, SpiBus,
-    X3EpdDriver,
+    ActivePowerGovernor, AdcButtonDecoder, Bq27220, DelayUs, Ds3231, EpdPins, HalError, I2cBus,
+    Qmi8658, SpiBus, X3EpdDriver,
 };
 
 use crate::{build_zip_bytes, build_zip_bytes_raw, encode_cp1251};
@@ -26,6 +30,62 @@ const SECTOR_SIZE: usize = 512;
 const DEFAULT_SD_SECTORS: u32 = 131_072; // 64 MiB FAT32 microSD image
 const MAX_READ_ALL_BYTES: u64 = 160 * 1024; // Exact mirror of firmware Fat32Handle::read_all limit
 const FRAME_HISTORY_CAP: usize = 64;
+const SIM_EFUSE_MAC: [u8; 6] = [0xAA, 0xBB, 0xCC, 0x33, 0x44, 0x55];
+const OTA_STAGE_SD_PATH: &str = "/.vvbook/ota_staged.bin";
+
+/// Simulated dual-sector NOR security region + live `ota_0` metadata (fixed 8 KB inline footprint).
+#[derive(Clone, Debug)]
+pub struct SimNorSecurityFlash {
+    pub sectors: [[u8; SECURITY_SECTOR_SIZE]; 2],
+    pub live_ota0_version: u32,
+    pub live_ota0_blake3: [u8; 32],
+    pub live_ota0_bytes: u32,
+}
+
+impl Default for SimNorSecurityFlash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SimNorSecurityFlash {
+    pub fn new() -> Self {
+        Self {
+            sectors: [[0xFFu8; SECURITY_SECTOR_SIZE]; 2],
+            live_ota0_version: 1,
+            live_ota0_blake3: [0u8; 32],
+            live_ota0_bytes: 0,
+        }
+    }
+}
+
+impl NorFlashRegion for SimNorSecurityFlash {
+    type Error = &'static str;
+
+    fn read_slot(&mut self, slot: usize, offset: usize, out: &mut [u8]) -> Result<(), Self::Error> {
+        let sec = self.sectors.get(slot).ok_or("bad slot")?;
+        let end = offset.checked_add(out.len()).ok_or("overflow")?;
+        let slice = sec.get(offset..end).ok_or("oob read")?;
+        out.copy_from_slice(slice);
+        Ok(())
+    }
+
+    fn erase_slot(&mut self, slot: usize) -> Result<(), Self::Error> {
+        let sec = self.sectors.get_mut(slot).ok_or("bad slot")?;
+        sec.fill(0xFF);
+        Ok(())
+    }
+
+    fn program_slot(&mut self, slot: usize, offset: usize, data: &[u8]) -> Result<(), Self::Error> {
+        let sec = self.sectors.get_mut(slot).ok_or("bad slot")?;
+        let end = offset.checked_add(data.len()).ok_or("overflow")?;
+        let dst = sec.get_mut(offset..end).ok_or("oob program")?;
+        for (d, &s) in dst.iter_mut().zip(data) {
+            *d &= s;
+        }
+        Ok(())
+    }
+}
 
 /// Pre-allocated raw 512-byte sector storage for the simulated SDHC card.
 /// Allocated on host RAM outside the ESP32-C3 320 KB SRAM arena guard.
@@ -53,6 +113,11 @@ pub struct SimBoardState {
     pub deep_sleeping: bool,
     pub panel_hv_standby: bool,
     pub rotated_180: bool,
+    pub cpu_mhz: u32,
+    pub radio_clk_gated: bool,
+    pub eco_entries: u32,
+    pub wfi_sleeps: u64,
+    pub eco_bus_faults: u32,
     pub sd_rail_faults: u32,
     pub oversize_read_all_rejections: u32,
     pub uptime_us: u64,
@@ -61,16 +126,26 @@ pub struct SimBoardState {
     pub epd_busy_us: u64,
     pub sd_sectors_read: u64,
     pub sd_sectors_written: u64,
+    pub nor_flash: SimNorSecurityFlash,
 }
 
 impl SimBoardState {
     fn new() -> Self {
+        Self::with_nor_flash(SimNorSecurityFlash::new())
+    }
+
+    fn with_nor_flash(nor_flash: SimNorSecurityFlash) -> Self {
         Self {
             sd_power_en: true,
             sd_power_save_hint: true,
             deep_sleeping: false,
             panel_hv_standby: false,
             rotated_180: false,
+            cpu_mhz: 160,
+            radio_clk_gated: true,
+            eco_entries: 0,
+            wfi_sleeps: 0,
+            eco_bus_faults: 0,
             sd_rail_faults: 0,
             oversize_read_all_rejections: 0,
             uptime_us: 0,
@@ -79,6 +154,7 @@ impl SimBoardState {
             epd_busy_us: 0,
             sd_sectors_read: 0,
             sd_sectors_written: 0,
+            nor_flash,
         }
     }
 }
@@ -90,6 +166,11 @@ pub struct SimHwStats {
     pub deep_sleeping: bool,
     pub panel_hv_standby: bool,
     pub rotated_180: bool,
+    pub cpu_mhz: u32,
+    pub radio_clk_gated: bool,
+    pub eco_entries: u32,
+    pub wfi_sleeps: u64,
+    pub eco_bus_faults: u32,
     pub sd_rail_faults: u32,
     pub oversize_read_all_rejections: u32,
     pub uptime_us: u64,
@@ -107,6 +188,11 @@ impl From<&SimBoardState> for SimHwStats {
             deep_sleeping: s.deep_sleeping,
             panel_hv_standby: s.panel_hv_standby,
             rotated_180: s.rotated_180,
+            cpu_mhz: s.cpu_mhz,
+            radio_clk_gated: s.radio_clk_gated,
+            eco_entries: s.eco_entries,
+            wfi_sleeps: s.wfi_sleeps,
+            eco_bus_faults: s.eco_bus_faults,
             sd_rail_faults: s.sd_rail_faults,
             oversize_read_all_rejections: s.oversize_read_all_rejections,
             uptime_us: s.uptime_us,
@@ -139,6 +225,9 @@ impl BlockDevice for SimSdhcCard {
                 b.sd_rail_faults = b.sd_rail_faults.saturating_add(1);
                 return Err(HalError::Bus);
             }
+            if b.cpu_mhz != 160 {
+                b.eco_bus_faults = b.eco_bus_faults.saturating_add(1);
+            }
             b.spi_sd_us = b.spi_sd_us.saturating_add(320);
             b.uptime_us = b.uptime_us.saturating_add(320);
             b.sd_sectors_read = b.sd_sectors_read.saturating_add(1);
@@ -158,6 +247,9 @@ impl BlockDevice for SimSdhcCard {
             if !b.sd_power_en {
                 b.sd_rail_faults = b.sd_rail_faults.saturating_add(1);
                 return Err(HalError::Bus);
+            }
+            if b.cpu_mhz != 160 {
+                b.eco_bus_faults = b.eco_bus_faults.saturating_add(1);
             }
             b.spi_sd_us = b.spi_sd_us.saturating_add(850);
             b.uptime_us = b.uptime_us.saturating_add(850);
@@ -430,6 +522,9 @@ impl SpiBus for SimEpdSpi {
             b.sd_rail_faults = b.sd_rail_faults.saturating_add(1);
             return Err(HalError::Bus);
         }
+        if b.cpu_mhz != 160 {
+            b.eco_bus_faults = b.eco_bus_faults.saturating_add(1);
+        }
         let xfer_us = (data.len() as u64).saturating_add(1) / 2;
         b.spi_epd_us = b.spi_epd_us.saturating_add(xfer_us);
         b.uptime_us = b.uptime_us.saturating_add(xfer_us);
@@ -631,6 +726,9 @@ impl SimI2cBus {
 impl I2cBus for SimI2cBus {
     fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HalError> {
         let mut b = self.board.borrow_mut();
+        if b.cpu_mhz != 160 {
+            b.eco_bus_faults = b.eco_bus_faults.saturating_add(1);
+        }
         b.uptime_us = b.uptime_us.saturating_add(120);
         if addr == QMI8658_I2C_ADDR && bytes.len() >= 2 {
             match bytes[0] {
@@ -656,6 +754,9 @@ impl I2cBus for SimI2cBus {
     fn write_read(&mut self, addr: u8, write: &[u8], read: &mut [u8]) -> Result<(), HalError> {
         {
             let mut b = self.board.borrow_mut();
+            if b.cpu_mhz != 160 {
+                b.eco_bus_faults = b.eco_bus_faults.saturating_add(1);
+            }
             b.uptime_us = b.uptime_us.saturating_add(150);
         }
         let reg = write.first().copied().unwrap_or(0);
@@ -768,6 +869,8 @@ impl PowerControl for X3TwinPowerControl {
         let mut b = self.board.borrow_mut();
         b.sd_power_en = false;
         b.deep_sleeping = true;
+        b.cpu_mhz = 0;
+        b.radio_clk_gated = true;
     }
 
     fn set_imu_flick(&mut self, enabled: bool) {
@@ -806,9 +909,9 @@ pub struct SimPortal {
 }
 
 impl SimPortal {
-    fn new() -> Self {
+    fn new_with_key(pub_key: [u8; 32], min_fw_version: u32) -> Self {
         Self {
-            state: VvDropServerState::new([0u8; 32], 1, 0x5656_464F),
+            state: VvDropServerState::new(pub_key, min_fw_version, 0x5656_464F),
             conn: StreamingHttpConn::new(false),
         }
     }
@@ -854,16 +957,23 @@ impl NetworkPortal for SimPortal {
     fn take_synced_datetime(&mut self) -> Option<DateTime> {
         self.state.synced_datetime.take()
     }
+
+    fn take_staged_ota(&mut self) -> Option<StagedOta> {
+        self.state.take_staged_ota()
+    }
 }
 
-pub struct SimEntropy(u64);
+pub struct SimEntropy(Blake3Drbg);
+
+impl SimEntropy {
+    pub fn from_seed(seed: u64) -> Self {
+        Self(Blake3Drbg::from_u64(seed))
+    }
+}
 
 impl EntropySource for SimEntropy {
     fn fill_bytes(&mut self, out: &mut [u8]) {
-        for b in out.iter_mut() {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            *b = (self.0 >> 32) as u8;
-        }
+        self.0.fill_bytes(out);
     }
 }
 
@@ -880,12 +990,20 @@ pub struct X3HardwareTwin {
     portal: SimPortal,
     entropy: SimEntropy,
     buttons: AdcButtonDecoder,
+    power_gov: ActivePowerGovernor,
     event_scratch: Vec<InputEvent>,
 }
 
 impl X3HardwareTwin {
     pub fn from_sd_image(image: PrebuiltSdImage) -> Self {
-        let board = Rc::new(RefCell::new(SimBoardState::new()));
+        Self::from_sd_and_flash(image, SimNorSecurityFlash::new())
+    }
+
+    pub fn from_sd_and_flash(image: PrebuiltSdImage, mut nor_flash: SimNorSecurityFlash) -> Self {
+        let sec = PersistentSecurityState::load_or_init(&mut nor_flash, &SIM_EFUSE_MAC, 1)
+            .expect("NOR security state load_or_init");
+        let min_fw_ver = sec.min_fw_version.max(nor_flash.live_ota0_version);
+        let board = Rc::new(RefCell::new(SimBoardState::with_nor_flash(nor_flash)));
         let sd_backing = Rc::new(RefCell::new(image));
         let card = SimSdhcCard::new(Rc::clone(&sd_backing), Rc::clone(&board));
         let vol = Fat32Volume::mount(card).expect("FAT32 volume mount on SimSdhcCard");
@@ -946,11 +1064,20 @@ impl X3HardwareTwin {
             epd_sink,
             sensors,
             power,
-            portal: SimPortal::new(),
-            entropy: SimEntropy(0x5854_4549_4E4B_5833),
+            portal: SimPortal::new_with_key(FOLIO_RELEASE_PUBKEY, min_fw_ver),
+            entropy: SimEntropy::from_seed(0x5854_4549_4E4B_5833),
             buttons: AdcButtonDecoder::new(),
+            power_gov: ActivePowerGovernor::new(0),
             event_scratch: Vec::with_capacity(4),
         }
+    }
+
+    /// Consumes the twin, returning both the raw SD image and simulated NOR flash state.
+    pub fn into_sd_and_flash(self) -> (PrebuiltSdImage, SimNorSecurityFlash) {
+        let sectors = std::mem::take(&mut self.sd_backing.borrow_mut().sectors);
+        let flash = self.board.borrow().nor_flash.clone();
+        drop(self);
+        (PrebuiltSdImage { sectors }, flash)
     }
 
     /// Consumes the twin, dropping firmware state inside any active heap guard while returning the
@@ -961,7 +1088,111 @@ impl X3HardwareTwin {
         PrebuiltSdImage { sectors }
     }
 
+    pub fn set_ota_pubkey(&mut self, pub_key: [u8; 32]) {
+        self.portal.state.ota_pub_key = pub_key;
+    }
+
+    pub fn security_state(&self) -> PersistentSecurityState {
+        let mut b = self.board.borrow_mut();
+        PersistentSecurityState::load_or_init(&mut b.nor_flash, &SIM_EFUSE_MAC, 1)
+            .expect("security state")
+    }
+
+    pub fn live_ota0_version(&self) -> u32 {
+        self.board.borrow().nor_flash.live_ota0_version
+    }
+
+    pub fn apply_staged_ota(&mut self) -> Result<u32, String> {
+        let staged = self
+            .portal
+            .take_staged_ota()
+            .ok_or_else(|| String::from("no staged OTA pending"))?;
+        self.install_staged_ota(staged)
+    }
+
+    fn remove_at_turbo(&mut self, path: &str) {
+        let prev = self.board.borrow().cpu_mhz;
+        self.board.borrow_mut().cpu_mhz = 160;
+        let _ = self.storage.remove(path);
+        self.board.borrow_mut().cpu_mhz = prev;
+    }
+
+    fn install_staged_ota(&mut self, staged: StagedOta) -> Result<u32, String> {
+        let current_min = self.security_state().min_fw_version;
+        let finish_err = |this: &mut Self, msg: String| -> Result<u32, String> {
+            this.remove_at_turbo(OTA_STAGE_SD_PATH);
+            this.portal.state.min_fw_version = current_min;
+            Err(msg)
+        };
+
+        if staged.payload_len == 0 || staged.payload_len > MAX_ESP32C3_OTA_BYTES {
+            return finish_err(self, String::from("OTA payload length out of range"));
+        }
+        let sd_len = match self.storage_file_len(OTA_STAGE_SD_PATH) {
+            Some(l) if l == u64::from(staged.payload_len) => l,
+            _ => return finish_err(self, String::from("staged SD OTA file size mismatch")),
+        };
+
+        let mut img_val = match Esp32c3ImageValidator::new(staged.payload_len) {
+            Ok(v) => v,
+            Err(e) => return finish_err(self, format!("ESP32-C3 header rejected: {e:?}")),
+        };
+        let mut hasher = blake3::Hasher::new();
+        let mut chunk = [0u8; 1024];
+        let mut off = 0u64;
+        while off < sd_len {
+            let n = self
+                .storage_read_slice(OTA_STAGE_SD_PATH, off, &mut chunk)
+                .unwrap_or(0);
+            if n == 0 {
+                return finish_err(self, String::from("unexpected EOF reading staged OTA"));
+            }
+            hasher.update(&chunk[..n]);
+            if let Err(e) = img_val.feed(&chunk[..n]) {
+                return finish_err(self, format!("ESP32-C3 image rejected: {e:?}"));
+            }
+            off += n as u64;
+        }
+        let digest = *hasher.finalize().as_bytes();
+        if !constant_time_eq(&digest, &staged.payload_blake3) {
+            return finish_err(self, String::from("staged OTA BLAKE3 digest mismatch"));
+        }
+        if let Err(e) = img_val.finish() {
+            return finish_err(self, format!("ESP32-C3 image final check failed: {e:?}"));
+        }
+
+        // Commit persistent security metadata + simulated live `ota_0` image and reboot cleanly.
+        {
+            let mut b = self.board.borrow_mut();
+            let mut sec =
+                PersistentSecurityState::load_or_init(&mut b.nor_flash, &SIM_EFUSE_MAC, 1)
+                    .map_err(String::from)?;
+            sec.record_ota_install(
+                staged.fw_version,
+                staged.payload_blake3,
+                PersistentSecurityState::FLAG_PENDING_STAGE_APPLY,
+            );
+            sec.commit(&mut b.nor_flash, &SIM_EFUSE_MAC)
+                .map_err(String::from)?;
+            b.nor_flash.live_ota0_version = staged.fw_version;
+            b.nor_flash.live_ota0_blake3 = staged.payload_blake3;
+            b.nor_flash.live_ota0_bytes = staged.payload_len;
+            sec.pending_flags = 0;
+            sec.commit(&mut b.nor_flash, &SIM_EFUSE_MAC)
+                .map_err(String::from)?;
+        }
+        self.remove_at_turbo(OTA_STAGE_SD_PATH);
+        self.portal.stop();
+
+        let pub_k = self.portal.state.ota_pub_key;
+        self.app = FolioApp::new();
+        self.portal = SimPortal::new_with_key(pub_k, staged.fw_version);
+        self.boot();
+        Ok(staged.fw_version)
+    }
+
     pub fn boot(&mut self) {
+        self.board.borrow_mut().cpu_mhz = 160;
         self.app.boot(
             &mut self.epd_sink,
             &mut self.storage,
@@ -970,6 +1201,8 @@ impl X3HardwareTwin {
             &mut self.portal,
             &mut self.entropy,
         );
+        self.power_gov.note_user_input(self.uptime_ms());
+        self.board.borrow_mut().radio_clk_gated = !self.portal.state.active;
         self.log_usb("[VVBOOK-OS] BOOT READY\n");
     }
 
@@ -1033,8 +1266,14 @@ impl X3HardwareTwin {
         self.event_scratch.clear();
         self.buttons
             .poll_into(now_ms, mv_a, mv_b, pwr, &mut self.event_scratch);
+        if self.buttons.has_active_or_pending() || !self.event_scratch.is_empty() {
+            self.power_gov
+                .note_input(now_ms, self.app.is_clean_reading_mode());
+            self.board.borrow_mut().cpu_mhz = 160;
+        }
         for i in 0..self.event_scratch.len() {
             let ev = self.event_scratch[i];
+            let prev_screen = self.app.screen;
             self.app.handle_event(
                 ev,
                 &mut self.epd_sink,
@@ -1044,14 +1283,43 @@ impl X3HardwareTwin {
                 &mut self.portal,
                 &mut self.entropy,
             );
+            if self.app.screen != prev_screen {
+                self.buttons.suppress_until_idle(self.uptime_ms(), 0);
+                break;
+            }
+        }
+        if !self.event_scratch.is_empty() && !self.board.borrow().deep_sleeping {
+            self.power_gov
+                .note_input(self.uptime_ms(), self.app.is_clean_reading_mode());
+        }
+        if !self.board.borrow().deep_sleeping {
+            let wifi_active = self.app.screen == Screen::VvDrop || self.portal.state.active;
+            let bg_pending = self.app.has_pending_background_work();
+            let mode = self
+                .power_gov
+                .select_mode(self.uptime_ms(), wifi_active, bg_pending);
+            let mut b = self.board.borrow_mut();
+            b.radio_clk_gated = !self.portal.state.active;
+            b.cpu_mhz = mode.awake_mhz();
+            b.eco_entries = self.power_gov.eco_entries();
         }
     }
 
     fn wake_if_sleeping(&mut self) {
-        let mut b = self.board.borrow_mut();
-        if b.deep_sleeping {
-            b.sd_power_en = true;
-            b.deep_sleeping = false;
+        let wake_ms = {
+            let mut b = self.board.borrow_mut();
+            if b.deep_sleeping {
+                b.sd_power_en = true;
+                b.deep_sleeping = false;
+                b.cpu_mhz = 160;
+                Some(b.uptime_us / 1_000)
+            } else {
+                None
+            }
+        };
+        if let Some(now_ms) = wake_ms {
+            self.power_gov
+                .note_input(now_ms, self.app.is_clean_reading_mode());
         }
     }
 
@@ -1077,9 +1345,13 @@ impl X3HardwareTwin {
     }
 
     pub fn advance_idle_ms(&mut self, delta_ms: u64) {
-        {
+        let now_ms = {
             let mut b = self.board.borrow_mut();
             b.uptime_us = b.uptime_us.saturating_add(delta_ms * 1_000);
+            b.uptime_us / 1_000
+        };
+        if self.app.tick_needs_io(now_ms) {
+            self.board.borrow_mut().cpu_mhz = 160;
         }
         self.app.tick(
             &mut self.epd_sink,
@@ -1088,6 +1360,26 @@ impl X3HardwareTwin {
             &mut self.power,
             &mut self.portal,
         );
+        if let Some(staged) = self.portal.take_staged_ota() {
+            let _ = self.install_staged_ota(staged);
+        }
+        self.board.borrow_mut().radio_clk_gated = !self.portal.state.active;
+        if self.board.borrow().deep_sleeping {
+            return;
+        }
+        let wifi_active = self.app.screen == Screen::VvDrop || self.portal.state.active;
+        let bg_pending = self.app.has_pending_background_work();
+        let mode = self
+            .power_gov
+            .select_mode(self.uptime_ms(), wifi_active, bg_pending);
+        if mode.uses_wfi() {
+            self.power_gov
+                .record_wfi_sleeps((delta_ms / ActivePowerGovernor::WFI_PERIOD_MS).max(1));
+        }
+        let mut b = self.board.borrow_mut();
+        b.cpu_mhz = mode.awake_mhz();
+        b.eco_entries = self.power_gov.eco_entries();
+        b.wfi_sleeps = self.power_gov.wfi_sleeps();
     }
 
     pub fn ensure_home(&mut self) {
@@ -1191,23 +1483,37 @@ impl X3HardwareTwin {
         self.press_button(Button::Confirm);
     }
 
+    fn read_at_turbo<T>(&self, f: impl FnOnce() -> T) -> T {
+        let prev = self.board.borrow().cpu_mhz;
+        self.board.borrow_mut().cpu_mhz = 160;
+        let out = f();
+        self.board.borrow_mut().cpu_mhz = prev;
+        out
+    }
+
     pub fn sensors_now(&mut self) -> DateTime {
-        self.sensors.now()
+        let prev = self.board.borrow().cpu_mhz;
+        self.board.borrow_mut().cpu_mhz = 160;
+        let out = self.sensors.now();
+        self.board.borrow_mut().cpu_mhz = prev;
+        out
     }
 
     pub fn storage_exists(&self, path: &str) -> bool {
-        self.storage.exists(path)
+        self.read_at_turbo(|| self.storage.exists(path))
     }
 
     pub fn storage_file_len(&self, path: &str) -> Option<u64> {
-        self.storage.file_len(path).ok()
+        self.read_at_turbo(|| self.storage.file_len(path).ok())
     }
 
     pub fn storage_read_slice(&self, path: &str, offset: u64, dst: &mut [u8]) -> Option<usize> {
-        self.storage.read_range(path, offset, dst).ok()
+        self.read_at_turbo(|| self.storage.read_range(path, offset, dst).ok())
     }
 
     pub fn vvdrop_http_exchange(&mut self, chunks: &[&[u8]], resp_out: &mut [u8]) -> usize {
+        self.power_gov.note_user_input(self.uptime_ms());
+        self.board.borrow_mut().cpu_mhz = 160;
         self.portal.state.clients_connected = self.portal.state.clients_connected.max(1);
         let mut total_tx = 0usize;
         for &chunk in chunks {
@@ -1963,6 +2269,15 @@ pub fn run_x3_stress_suite(host_dir: Option<&Path>) -> Result<X3StressReport, St
             hw.oversize_read_all_rejections
         ));
     }
+    if hw.eco_bus_faults != 0 {
+        return Err(format!("detected {} eco bus faults", hw.eco_bus_faults));
+    }
+    if hw.eco_entries == 0 || hw.wfi_sleeps == 0 {
+        return Err(format!(
+            "expected Eco WFI activity during idle (eco_entries={}, wfi_sleeps={})",
+            hw.eco_entries, hw.wfi_sleeps
+        ));
+    }
 
     Ok(X3StressReport {
         catalog_count,
@@ -1990,11 +2305,17 @@ pub fn format_stress_report(r: &X3StressReport) -> String {
     );
     let _ = writeln!(
         out,
-        "Hardware rails     : sd_rail_faults={}, oversize_read_all={}, sd_sectors(r={}, w={})",
+        "Hardware rails     : sd_rail_faults={}, oversize_read_all={}, eco_bus_faults={}, sd_sectors(r={}, w={})",
         r.hw.sd_rail_faults,
         r.hw.oversize_read_all_rejections,
+        r.hw.eco_bus_faults,
         r.hw.sd_sectors_read,
         r.hw.sd_sectors_written
+    );
+    let _ = writeln!(
+        out,
+        "Power governor     : cpu={} MHz, radio_gated={}, eco_entries={}, wfi_sleeps={}",
+        r.hw.cpu_mhz, r.hw.radio_clk_gated, r.hw.eco_entries, r.hw.wfi_sleeps
     );
     let _ = writeln!(
         out,

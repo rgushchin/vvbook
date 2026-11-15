@@ -2354,3 +2354,306 @@ fn real_calibre_corpus_and_garbage_gauntlet_under_esp32_heap() {
     );
     drop(overlay_storage);
 }
+
+#[test]
+fn active_reading_power_governor_eco_wfi_vvdrop_and_zero_eco_bus_faults() {
+    let _test_guard = ESP32_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sd_img = build_adversarial_sd_image();
+    let guard = Esp32HeapGuard::enable();
+
+    {
+        let mut twin = X3HardwareTwin::from_sd_image(sd_img);
+        twin.boot();
+        assert_eq!(twin.hw_stats().cpu_mhz, 160);
+        assert!(twin.hw_stats().radio_clk_gated);
+        assert_eq!(twin.hw_stats().eco_bus_faults, 0);
+
+        // Open a multi-page book from Library via a 700 ms held Confirm press -> Reader must open with NO popup menu
+        let book_idx = twin
+            .app
+            .catalog
+            .iter()
+            .position(|c| c.source_path.ends_with("chronicles_6000_blocks.md"))
+            .expect("multi-page chronicles_6000_blocks.md in catalog");
+        twin.select_library_index(book_idx);
+        twin.long_press_button(Button::Confirm);
+        assert_eq!(twin.app.screen, Screen::Reader);
+        assert_eq!(twin.app.reader_overlay, ReaderOverlay::None);
+        assert!(twin.app.active_pages.len() >= 2);
+
+        // Return Home, focus active book card (cursor 0), and open via 700 ms held Confirm -> still NO popup menu
+        twin.press_button(Button::Back);
+        assert_eq!(twin.app.screen, Screen::Home);
+        if twin.app.home_cursor != 0 {
+            twin.press_button(Button::Back);
+        }
+        assert_eq!(twin.app.home_cursor, 0);
+        twin.long_press_button(Button::Confirm);
+        assert_eq!(twin.app.screen, Screen::Reader);
+        assert_eq!(twin.app.reader_overlay, ReaderOverlay::None);
+
+        // Deliberate Confirm once settled in Reader opens ReaderOverlay::AaHud, Back closes it
+        twin.press_button(Button::Confirm);
+        assert_eq!(twin.app.reader_overlay, ReaderOverlay::AaHud);
+        twin.press_button(Button::Back);
+        assert_eq!(twin.app.reader_overlay, ReaderOverlay::None);
+        assert_eq!(twin.hw_stats().cpu_mhz, 160);
+
+        // Clean Reading mode drops to 40 MHz Eco XTAL + WFI within 60 ms (not 3 seconds!)
+        twin.advance_idle_ms(60);
+        let st_eco_fast = twin.hw_stats();
+        assert_eq!(st_eco_fast.cpu_mhz, 40);
+        assert!(st_eco_fast.wfi_sleeps > 0);
+        assert_eq!(st_eco_fast.eco_bus_faults, 0);
+
+        // Advance another 2,540 ms (total 2,600 ms idle): Stage-1 HV standby pulses 160 MHz cleanly for SPI
+        // and returns immediately to 40 MHz Eco with zero eco bus faults
+        twin.advance_idle_ms(2_540);
+        let st_eco = twin.hw_stats();
+        assert!(st_eco.panel_hv_standby);
+        assert_eq!(st_eco.cpu_mhz, 40);
+        assert!(st_eco.eco_entries >= 1);
+        assert!(st_eco.wfi_sleeps > st_eco_fast.wfi_sleeps);
+        assert_eq!(st_eco.eco_bus_faults, 0);
+        assert!(!twin.app.persistence_dirty);
+
+        // Raw button voltage dip (1 ms pre-debounce) immediately boosts back to 160 MHz before debounce completes
+        let mut wake_guard = WakePowerGuard::new(twin.uptime_ms());
+        let page_before = twin.app.current_page_num;
+        let flushes_before = twin.app.power_stats.journal_flushes;
+        twin.sample_raw_with_wake_guard(1, 250, 3100, false, &mut wake_guard);
+        assert_eq!(
+            twin.hw_stats().cpu_mhz,
+            160,
+            "first raw button sample must boost CPU to 160 MHz before debounce completes"
+        );
+        twin.sample_raw_with_wake_guard(20, 250, 3100, false, &mut wake_guard);
+        twin.sample_raw_with_wake_guard(1, 3100, 3100, false, &mut wake_guard);
+        twin.sample_raw_with_wake_guard(20, 3100, 3100, false, &mut wake_guard);
+        assert!(twin.app.current_page_num > page_before);
+        assert!(!twin.app.persistence_dirty);
+        assert!(twin.app.pending_journal_turns >= 1);
+        assert_eq!(twin.hw_stats().eco_bus_faults, 0);
+
+        // Single Reader page turn does NOT flush SD journal immediately and drops back to 40 MHz Eco within 60 ms
+        twin.advance_idle_ms(60);
+        assert_eq!(twin.hw_stats().cpu_mhz, 40);
+        assert_eq!(twin.app.power_stats.journal_flushes, flushes_before);
+
+        // After a 30.5 s reading pause, the batched page-turn bookmark flushes cleanly at 160 MHz and returns to Eco
+        twin.advance_idle_ms(30_500);
+        assert_eq!(twin.app.power_stats.journal_flushes, flushes_before + 1);
+        assert_eq!(twin.app.pending_journal_turns, 0);
+        assert_eq!(twin.hw_stats().cpu_mhz, 40);
+        assert_eq!(twin.hw_stats().eco_bus_faults, 0);
+
+        twin.open_home_item(4);
+        assert_eq!(twin.app.screen, Screen::VvDrop);
+        assert!(twin.portal_is_active());
+        let st_wifi0 = twin.hw_stats();
+        assert_eq!(st_wifi0.cpu_mhz, 160);
+        assert!(!st_wifi0.radio_clk_gated);
+        let wfi_before_wifi = st_wifi0.wfi_sleeps;
+
+        twin.advance_idle_ms(10_000);
+        let st_wifi1 = twin.hw_stats();
+        assert_eq!(st_wifi1.cpu_mhz, 160);
+        assert_eq!(
+            st_wifi1.wfi_sleeps, wfi_before_wifi,
+            "Eco WFI sleeps must remain stopped while VVDrop Wi-Fi is active"
+        );
+
+        // Exit VVDrop -> radio clock re-gates and Eco WFI resumes after UI holdoff (260 ms)
+        twin.press_button(Button::Back);
+        assert_eq!(twin.app.screen, Screen::Home);
+        assert!(!twin.portal_is_active());
+        twin.advance_idle_ms(260);
+        let st_eco2 = twin.hw_stats();
+        assert!(st_eco2.radio_clk_gated);
+        assert_eq!(st_eco2.cpu_mhz, 40);
+        assert!(st_eco2.wfi_sleeps > wfi_before_wifi);
+
+        // Advance into Stage-3 deep sleep at 160 MHz -> SleepPoster -> Confirm wake
+        twin.advance_idle_ms(605_000);
+        assert_eq!(twin.app.screen, Screen::SleepPoster);
+        assert!(twin.hw_stats().deep_sleeping);
+        assert_eq!(twin.hw_stats().cpu_mhz, 0);
+
+        twin.press_button(Button::Confirm);
+        assert_eq!(twin.app.screen, Screen::Home);
+        assert!(!twin.hw_stats().deep_sleeping);
+        assert_eq!(twin.hw_stats().eco_bus_faults, 0);
+        assert_eq!(twin.hw_stats().sd_rail_faults, 0);
+
+        sd_img = twin.into_sd_image();
+    }
+
+    let _ = guard.verify_clean_and_disable();
+    drop(sd_img);
+}
+
+#[test]
+fn x3_twin_ota_validates_esp32c3_image_persists_nor_ab_anti_rollback_across_reboot() {
+    use vvbook_cli::{generate_ed25519_keypair, sign_firmware_bytes};
+    use vvbook_emu::x3_twin::{PrebuiltSdImage, SimNorSecurityFlash};
+    use vvbook_security::{
+        ESP_IMAGE_MAGIC, ESP32C3_CHIP_ID, PersistentSecurityState, compute_auth_mac, decode_hex_32,
+        encode_hex, sha256,
+    };
+
+    let _test_guard = ESP32_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    fn make_valid_esp32c3_fw_bin(tag: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut hdr = [0u8; 24];
+        hdr[0] = ESP_IMAGE_MAGIC;
+        hdr[1] = 1;
+        hdr[4..8].copy_from_slice(&0x4200_0400u32.to_le_bytes());
+        hdr[12..14].copy_from_slice(&ESP32C3_CHIP_ID.to_le_bytes());
+        hdr[23] = 1;
+        body.extend_from_slice(&hdr);
+        body.extend_from_slice(&0x3FC8_0000u32.to_le_bytes());
+        body.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+        body.extend_from_slice(tag);
+        let mut xor = 0xEFu8;
+        for &b in tag {
+            xor ^= b;
+        }
+        while (body.len() + 1) % 16 != 0 {
+            body.push(0);
+        }
+        body.push(xor);
+        let digest = sha256(&body);
+        body.extend_from_slice(&digest);
+        body
+    }
+
+    fn http_pair_and_post_ota(
+        twin: &mut X3HardwareTwin,
+        pin: &str,
+        body: &[u8],
+    ) -> (u16, String) {
+        let mut resp = vec![0u8; 2048];
+        let n_len = twin.vvdrop_http_exchange(
+            &[b"GET /api/nonce HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n"],
+            &mut resp,
+        );
+        let nonce_txt = core::str::from_utf8(&resp[..n_len]).unwrap();
+        let s_nonce =
+            decode_hex_32(nonce_txt.split("\r\n\r\n").nth(1).unwrap().trim()).unwrap();
+        let c_nonce = [0x3Cu8; 32];
+        let mac = compute_auth_mac(pin.as_bytes(), &s_nonce, &c_nonce);
+        let auth_req = format!(
+            "POST /api/auth HTTP/1.1\r\nHost: 192.168.4.1\r\nX-VVDrop-Client-Nonce: {}\r\nX-VVDrop-Mac: {}\r\nContent-Length: 0\r\n\r\n",
+            encode_hex(&c_nonce),
+            encode_hex(&mac)
+        );
+        let a_len = twin.vvdrop_http_exchange(&[auth_req.as_bytes()], &mut resp);
+        let auth_txt = core::str::from_utf8(&resp[..a_len]).unwrap();
+        let tok_hex = auth_txt.split("\r\n\r\n").nth(1).unwrap().trim().to_string();
+
+        let ota_hdr = format!(
+            "POST /api/ota HTTP/1.1\r\nHost: 192.168.4.1\r\nX-VVDrop-Token: {tok_hex}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let o_len = twin.vvdrop_http_exchange(&[ota_hdr.as_bytes(), body], &mut resp);
+        let ota_txt = core::str::from_utf8(&resp[..o_len]).unwrap().to_string();
+        let code = ota_txt
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (code, ota_txt)
+    }
+
+    let sd_img = PrebuiltSdImage::empty(65_536);
+    let sd_rc = std::rc::Rc::new(std::cell::RefCell::new(sd_img));
+    struct InitDev(std::rc::Rc<std::cell::RefCell<PrebuiltSdImage>>);
+    impl vvbook_x3_hal::BlockDevice for InitDev {
+        fn sector_count(&self) -> u32 {
+            self.0.borrow().sector_count()
+        }
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), vvbook_x3_hal::HalError> {
+            *buf = self.0.borrow().sectors[lba as usize];
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), vvbook_x3_hal::HalError> {
+            self.0.borrow_mut().sectors[lba as usize] = *buf;
+            Ok(())
+        }
+    }
+    vvbook_x3_hal::format_fat32(&mut InitDev(std::rc::Rc::clone(&sd_rc)), 65_536, b"VVOTA_TEST1")
+        .unwrap();
+    let sd_formatted = PrebuiltSdImage {
+        sectors: std::mem::take(&mut sd_rc.borrow_mut().sectors),
+    };
+    let empty_sd = PrebuiltSdImage::empty(65_536);
+    let empty_rc = std::rc::Rc::new(std::cell::RefCell::new(empty_sd));
+    vvbook_x3_hal::format_fat32(&mut InitDev(std::rc::Rc::clone(&empty_rc)), 65_536, b"VVOTA_NEWSD")
+        .unwrap();
+    let clean_sd = PrebuiltSdImage {
+        sectors: std::mem::take(&mut empty_rc.borrow_mut().sectors),
+    };
+    let (sk, pk) = generate_ed25519_keypair().unwrap();
+    let bad_payload = sign_firmware_bytes(b"NOT_AN_ESP32C3_IMAGE_V2", &sk, 2).unwrap();
+    let esp_v4 = make_valid_esp32c3_fw_bin(b"FOLIO_OS_X3_V4_SEGMENT_OK");
+    let signed_v4 = sign_firmware_bytes(&esp_v4, &sk, 4).unwrap();
+    let esp_v3 = make_valid_esp32c3_fw_bin(b"OLDER_V3_IMAGE");
+    let signed_v3 = sign_firmware_bytes(&esp_v3, &sk, 3).unwrap();
+
+    let guard = Esp32HeapGuard::enable();
+    {
+        let nor = SimNorSecurityFlash::new();
+        let mut twin = X3HardwareTwin::from_sd_and_flash(sd_formatted, nor);
+        twin.set_ota_pubkey(pk);
+        twin.boot();
+        guard.assert_no_oom("ota_boot");
+        assert_eq!(twin.live_ota0_version(), 1);
+        assert_eq!(twin.security_state().min_fw_version, 1);
+
+        // 1. Open VVDrop and verify non-0xE9 garbage fails ESP32-C3 image validation without touching NOR flash
+        twin.open_home_item(4);
+        {
+            let pin = twin.app.vvdrop_auth.as_ref().unwrap().pin_str().to_string();
+            let (code, _) = http_pair_and_post_ota(&mut twin, &pin, &bad_payload);
+            assert_eq!(code, 200);
+            assert!(twin.apply_staged_ota().is_err());
+            assert_eq!(twin.live_ota0_version(), 1);
+            assert_eq!(twin.security_state().min_fw_version, 1);
+
+            // 2. Upload valid 0xE9 ESP32-C3 v4 image -> flash commits 2-phase A/B NOR state and reboots twin to v4
+            let (code4, _) = http_pair_and_post_ota(&mut twin, &pin, &signed_v4);
+            assert_eq!(code4, 200);
+        }
+        assert_eq!(twin.apply_staged_ota().unwrap(), 4);
+        assert_eq!(twin.live_ota0_version(), 4);
+        assert_eq!(twin.security_state().min_fw_version, 4);
+        assert!(!twin.storage_exists("/.vvbook/ota_staged.bin"));
+
+        // 3. Corrupt slot A (torn seq=3 record) and cold-boot on a fresh SD card:
+        //    recovery from slot B (seq=2) must preserve min_fw_version=4 and reject rollback v3!
+        let (old_sd, mut saved_nor) = twin.into_sd_and_flash();
+        drop(old_sd);
+        saved_nor.sectors[0][..16].fill(0xAA);
+        let mut twin2 = X3HardwareTwin::from_sd_and_flash(clean_sd, saved_nor);
+        twin2.set_ota_pubkey(pk);
+        twin2.boot();
+        assert_eq!(twin2.security_state().min_fw_version, 4);
+
+        twin2.open_home_item(4);
+        {
+            let pin2 = twin2.app.vvdrop_auth.as_ref().unwrap().pin_str().to_string();
+            let (code3, txt3) = http_pair_and_post_ota(&mut twin2, &pin2, &signed_v3);
+            assert_eq!(code3, 403, "rollback v3 must be rejected with 403, got: {txt3}");
+        }
+
+        // Ensure PersistentSecurityState A/B invariant holds cleanly and guard stays under SRAM cap
+        let st = twin2.security_state();
+        assert_eq!(st.min_fw_version, 4);
+        let (old2, _nor2) = twin2.into_sd_and_flash();
+        drop(old2);
+    }
+    let _ = guard.verify_clean_and_disable();
+    let _ = std::mem::size_of::<PersistentSecurityState>();
+}

@@ -16,11 +16,11 @@ use vvbook_games::pocket_pip::PipTab;
 use vvbook_pal::{
     BatteryStatus, Button, DateTime, DeviceSensors, DirEntry, DisplaySink, EntropySource,
     InputEvent, NetworkPortal, PORTRAIT_H, PORTRAIT_W, PortalStatus, PowerControl, ROW_2BPP_BYTES,
-    RefreshMode, StorageBackend, StorageError, Tone,
+    RefreshMode, StagedOta, StorageBackend, StorageError, Tone,
 };
 use vvbook_security::{
-    HW_TARGET_XTEINK_X3, StreamingFwVerifier, VvDropAuth, compute_auth_mac, decode_hex_32,
-    encode_hex,
+    Blake3Drbg, FOLIO_RELEASE_PUBKEY, HW_TARGET_XTEINK_X3, MAX_ESP32C3_OTA_BYTES, SignedFwHeader,
+    StreamingFwVerifier, VvDropAuth, compute_auth_mac, decode_hex_32, encode_hex,
 };
 use vvbook_userspace::{FolioApp, ReaderOverlay, SleepPosterKind, UiLang};
 
@@ -335,6 +335,9 @@ impl StorageBackend for FsStorage {
 
     fn remove(&mut self, path: &str) -> Result<(), StorageError> {
         let p = self.resolve(path)?;
+        if fs::metadata(&p).map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(StorageError::InvalidPath);
+        }
         fs::remove_file(p).map_err(|_| StorageError::NotFound)
     }
 
@@ -469,25 +472,37 @@ impl DisplaySink for EmuDisplaySink {
     }
 }
 
-pub struct HostEntropy(pub u64);
+pub struct HostEntropy(Blake3Drbg);
 
 impl HostEntropy {
     pub fn from_system() -> Self {
-        let mut buf = [0u8; 8];
+        let mut seed = [0u8; 32];
+        let mut ok = false;
         if let Ok(mut f) = fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut buf);
+            ok = f.read_exact(&mut seed).is_ok();
         }
-        let s = u64::from_le_bytes(buf);
-        Self(if s == 0 { 0xCAFE_BABE_1234_5678 } else { s })
+        let mut drbg = Blake3Drbg::from_seed(seed);
+        if !ok {
+            use std::hash::BuildHasher;
+            for salt in 0u64..4 {
+                let rs = std::collections::hash_map::RandomState::new();
+                drbg.reseed(&rs.hash_one(salt).to_le_bytes());
+            }
+            if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                drbg.reseed(&d.as_nanos().to_le_bytes());
+            }
+        }
+        Self(drbg)
+    }
+
+    pub fn from_seed_u64(seed: u64) -> Self {
+        Self(Blake3Drbg::from_u64(seed))
     }
 }
 
 impl EntropySource for HostEntropy {
     fn fill_bytes(&mut self, out: &mut [u8]) {
-        for b in out.iter_mut() {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            *b = (self.0 >> 32) as u8;
-        }
+        self.0.fill_bytes(out);
     }
 }
 
@@ -579,13 +594,14 @@ struct PortalState {
     active: bool,
     pin: String,
     auth: VvDropAuth,
-    rng: HostEntropy,
+    rng: Blake3Drbg,
     rx_bytes: u64,
     last_received: Option<String>,
     pending_uploads: VecDeque<(String, Vec<u8>)>,
     ota_pub_key: [u8; 32],
     min_fw_version: u32,
     staged_ota: Option<(u32, Vec<u8>)>,
+    staged_meta: Option<StagedOta>,
 }
 
 /// Live local TCP HTTP portal backing `VVDrop` wireless drops and Ed25519 `/api/ota` updates.
@@ -600,7 +616,7 @@ impl LivePortalServer {
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        let mut rng = HostEntropy::from_system();
+        let mut rng = HostEntropy::from_system().0;
         let auth = VvDropAuth::from_fixed_pin(*b"42819305", &mut rng);
         let state = Arc::new(Mutex::new(PortalState {
             active: false,
@@ -613,6 +629,7 @@ impl LivePortalServer {
             ota_pub_key,
             min_fw_version,
             staged_ota: None,
+            staged_meta: None,
         }));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let st_bg = Arc::clone(&state);
@@ -665,8 +682,15 @@ impl NetworkPortal for LivePortalServer {
         for (i, b) in pin.as_bytes().iter().take(8).enumerate() {
             pin_bytes[i] = *b;
         }
-        let mut rng = HostEntropy(st.rng.0 ^ 0x5A5A_1122);
+        st.rng.reseed(&pin_bytes);
+        let fresh = HostEntropy::from_system();
+        let mut extra = [0u8; 16];
+        let mut f = fresh;
+        f.fill_bytes(&mut extra);
+        st.rng.reseed(&extra);
+        let mut rng = st.rng.clone();
         st.auth = VvDropAuth::from_fixed_pin(pin_bytes, &mut rng);
+        st.rng = rng;
     }
 
     fn stop(&mut self) {
@@ -691,6 +715,10 @@ impl NetworkPortal for LivePortalServer {
 
     fn take_pending_ingest(&mut self) -> Option<(String, Vec<u8>)> {
         self.state.lock().unwrap().pending_uploads.pop_front()
+    }
+
+    fn take_staged_ota(&mut self) -> Option<StagedOta> {
+        self.state.lock().unwrap().staged_meta.take()
     }
 }
 
@@ -784,45 +812,6 @@ fn hdr_val<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn handle_portal_http(stream: &mut TcpStream, state: &Arc<Mutex<PortalState>>) -> Option<()> {
     let (method, path, headers, body) = read_http_request(stream)?;
 
-    if path == "/api/ota" && method == "POST" {
-        if body.len() < vvbook_security::SignedFwHeader::SIZE {
-            send_http_resp(stream, 400, "Bad Request", "text/plain", b"truncated header");
-            return Some(());
-        }
-        let mut st = state.lock().unwrap();
-        let mut v = match StreamingFwVerifier::start(
-            &body[..vvbook_security::SignedFwHeader::SIZE],
-            &st.ota_pub_key,
-            st.min_fw_version,
-            HW_TARGET_XTEINK_X3,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("OTA header rejected: {e:?}");
-                send_http_resp(stream, 403, "Forbidden", "text/plain", msg.as_bytes());
-                return Some(());
-            }
-        };
-        let payload = &body[vvbook_security::SignedFwHeader::SIZE..];
-        if let Err(e) = v.feed(payload) {
-            let msg = format!("OTA stream error: {e:?}");
-            send_http_resp(stream, 400, "Bad Request", "text/plain", msg.as_bytes());
-            return Some(());
-        }
-        match v.finish() {
-            Ok(hdr) => {
-                st.min_fw_version = hdr.fw_version;
-                st.staged_ota = Some((hdr.fw_version, payload.to_vec()));
-                send_http_resp(stream, 200, "OK", "text/plain", b"OTA verified and staged");
-            }
-            Err(e) => {
-                let msg = format!("OTA verify failed: {e:?}");
-                send_http_resp(stream, 403, "Forbidden", "text/plain", msg.as_bytes());
-            }
-        }
-        return Some(());
-    }
-
     let mut st = state.lock().unwrap();
     if !st.active {
         send_http_resp(stream, 503, "Service Unavailable", "text/plain", b"VVDrop closed on device");
@@ -830,6 +819,60 @@ fn handle_portal_http(stream: &mut TcpStream, state: &Arc<Mutex<PortalState>>) -
     }
 
     match (method.as_str(), path.as_str()) {
+        ("POST", "/api/ota") => {
+            let Some(tok_hex) = hdr_val(&headers, "x-vvdrop-token") else {
+                send_http_resp(stream, 401, "Unauthorized", "text/plain", b"missing token");
+                return Some(());
+            };
+            let Some(tok) = decode_hex_32(tok_hex) else {
+                send_http_resp(stream, 401, "Unauthorized", "text/plain", b"bad token");
+                return Some(());
+            };
+            if st.auth.verify_token(&tok).is_err() {
+                send_http_resp(stream, 401, "Unauthorized", "text/plain", b"invalid token");
+                return Some(());
+            }
+            let max_ota = SignedFwHeader::SIZE + MAX_ESP32C3_OTA_BYTES as usize;
+            if body.len() < SignedFwHeader::SIZE || body.len() > max_ota {
+                send_http_resp(stream, 400, "Bad Request", "text/plain", b"invalid ota size");
+                return Some(());
+            }
+            let mut v = match StreamingFwVerifier::start(
+                &body[..SignedFwHeader::SIZE],
+                &st.ota_pub_key,
+                st.min_fw_version,
+                HW_TARGET_XTEINK_X3,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format!("OTA header rejected: {e:?}");
+                    send_http_resp(stream, 403, "Forbidden", "text/plain", msg.as_bytes());
+                    return Some(());
+                }
+            };
+            let payload = &body[SignedFwHeader::SIZE..];
+            if let Err(e) = v.feed(payload) {
+                let msg = format!("OTA stream error: {e:?}");
+                send_http_resp(stream, 400, "Bad Request", "text/plain", msg.as_bytes());
+                return Some(());
+            }
+            match v.finish() {
+                Ok(hdr) => {
+                    st.min_fw_version = hdr.fw_version;
+                    st.staged_ota = Some((hdr.fw_version, payload.to_vec()));
+                    st.staged_meta = Some(StagedOta {
+                        fw_version: hdr.fw_version,
+                        payload_len: hdr.payload_len,
+                        payload_blake3: hdr.payload_blake3,
+                    });
+                    send_http_resp(stream, 200, "OK", "text/plain", b"OTA verified and staged");
+                }
+                Err(e) => {
+                    let msg = format!("OTA verify failed: {e:?}");
+                    send_http_resp(stream, 403, "Forbidden", "text/plain", msg.as_bytes());
+                }
+            }
+        }
         ("GET", "/") | ("GET", "/index.html") => {
             send_http_resp(stream, 200, "OK", "text/html; charset=utf-8", VVDROP_WEB_HTML.as_bytes());
         }
@@ -841,13 +884,6 @@ fn handle_portal_http(stream: &mut TcpStream, state: &Arc<Mutex<PortalState>>) -
             send_http_resp(stream, 200, "OK", "text/plain", hex.as_bytes());
         }
         ("POST", "/api/auth") => {
-            if hdr_val(&headers, "x-vvdrop-wpa2-session") == Some("1")
-                && hdr_val(&headers, "x-vvdrop-mac").is_none()
-                && hdr_val(&headers, "x-vvdrop-pin").is_none()
-            {
-                send_http_resp(stream, 401, "Unauthorized", "text/plain", b"wpa2 session requires key");
-                return Some(());
-            }
             let Some(cn_hex) = hdr_val(&headers, "x-vvdrop-client-nonce") else {
                 send_http_resp(stream, 400, "Bad Request", "text/plain", b"missing client nonce");
                 return Some(());
@@ -875,9 +911,9 @@ fn handle_portal_http(stream: &mut TcpStream, state: &Arc<Mutex<PortalState>>) -
                 return Some(());
             };
 
-            let mut rng = HostEntropy(st.rng.0.wrapping_add(1337));
+            let mut rng = st.rng.clone();
             let res = st.auth.verify_and_issue_token(&cn, &mac, &mut rng);
-            st.rng.0 = rng.0;
+            st.rng = rng;
             match res {
                 Ok(tok) => {
                     send_http_resp(stream, 200, "OK", "text/plain", encode_hex(&tok).as_bytes());
@@ -980,8 +1016,8 @@ pub fn export_all_snapshots(out_dir: &Path, sample_dir: &Path) -> Result<Vec<Pat
     let mut sink = EmuDisplaySink::new();
     let mut sensors = EmuSensors::default();
     let mut power = EmuPower::default();
-    let mut ent = HostEntropy(0x2026_1112_7777);
-    let mut portal = LivePortalServer::bind("127.0.0.1:0", [0u8; 32], 1).map_err(|e| e.to_string())?;
+    let mut ent = HostEntropy::from_seed_u64(0x2026_1112_7777);
+    let mut portal = LivePortalServer::bind("127.0.0.1:0", FOLIO_RELEASE_PUBKEY, 1).map_err(|e| e.to_string())?;
 
     let mut app = FolioApp::new();
     app.boot(&mut sink, &mut storage, &mut sensors, &mut power, &mut portal, &mut ent);

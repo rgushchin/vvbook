@@ -203,25 +203,6 @@ async function handleFiles(files) {
   }
   document.getElementById('fileIn').value = '';
 }
-
-async function tryWpa2AutoPair() {
-  try {
-    const res = await fetch('/api/auth', {
-      method: 'POST',
-      headers: {
-        'X-VVDrop-Wpa2-Session': '1',
-        'X-VVDrop-Datetime': localStamp()
-      }
-    });
-    if (res.ok) {
-      token = (await res.text()).trim();
-      document.getElementById('pairBox').classList.add('hidden');
-      document.getElementById('dropBox').classList.remove('hidden');
-      document.getElementById('statusTxt').textContent = T[lang].paired;
-    }
-  } catch (_) {}
-}
-tryWpa2AutoPair();
 </script>
 </body>
 </html>

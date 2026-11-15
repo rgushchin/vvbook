@@ -214,28 +214,27 @@ fn http_request(
 
 /// Authenticate to a live VVDrop server with HMAC-BLAKE3 challenge-response and upload a document.
 /// Automatically converts `.pdf` inputs to `.vvb` before sending.
-pub fn send_file_over_http(
-    base_url: &str,
-    pin: &str,
-    filename: &str,
-    raw_bytes: &[u8],
-) -> Result<(), String> {
-    let (host_port, _) = parse_http_host_port(base_url)?;
-    let (nonce_code, nonce_body) = http_request(&host_port, "GET", "/api/nonce", &[], &[])?;
+fn authenticate_vvdrop_session(host_port: &str, pin: &str) -> Result<String, String> {
+    let (nonce_code, nonce_body) = http_request(host_port, "GET", "/api/nonce", &[], &[])?;
     if nonce_code != 200 {
         return Err(format!("GET /api/nonce failed with HTTP {nonce_code}"));
     }
     let nonce_str = std::str::from_utf8(&nonce_body).unwrap_or("").trim();
-    let server_nonce = decode_hex_32(nonce_str).ok_or_else(|| "invalid server nonce hex".to_string())?;
+    let server_nonce =
+        decode_hex_32(nonce_str).ok_or_else(|| "invalid server nonce hex".to_string())?;
 
     let mut client_nonce = [0u8; 32];
     read_urandom(&mut client_nonce)?;
-    let mac = compute_auth_mac(pin.as_bytes(), &server_nonce, &client_nonce);
+    let clean_pin: String = pin
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    let mac = compute_auth_mac(clean_pin.as_bytes(), &server_nonce, &client_nonce);
 
     let cn_hex = encode_hex(&client_nonce);
     let mac_hex = encode_hex(&mac);
     let (auth_code, auth_body) = http_request(
-        &host_port,
+        host_port,
         "POST",
         "/api/auth",
         &[("X-VVDrop-Client-Nonce", &cn_hex), ("X-VVDrop-Mac", &mac_hex)],
@@ -247,7 +246,17 @@ pub fn send_file_over_http(
             String::from_utf8_lossy(&auth_body)
         ));
     }
-    let token_hex = std::str::from_utf8(&auth_body).unwrap_or("").trim().to_string();
+    Ok(std::str::from_utf8(&auth_body).unwrap_or("").trim().to_string())
+}
+
+pub fn send_file_over_http(
+    base_url: &str,
+    pin: &str,
+    filename: &str,
+    raw_bytes: &[u8],
+) -> Result<(), String> {
+    let (host_port, _) = parse_http_host_port(base_url)?;
+    let token_hex = authenticate_vvdrop_session(&host_port, pin)?;
 
     let (upload_name, upload_bytes): (String, Vec<u8>) =
         if filename.to_ascii_lowercase().ends_with(".pdf") {
@@ -281,4 +290,30 @@ pub fn send_file_over_http(
         ));
     }
     Ok(())
+}
+
+/// Authenticate with a VVDrop portal via PIN challenge-response and upload a signed `.vvfw` OTA package.
+pub fn send_ota_over_http(
+    host_port_or_url: &str,
+    pin: &str,
+    signed_fw: &[u8],
+) -> Result<String, String> {
+    let host_port = if host_port_or_url.contains("://") {
+        parse_http_host_port(host_port_or_url)?.0
+    } else {
+        host_port_or_url.to_string()
+    };
+    let token_hex = authenticate_vvdrop_session(&host_port, pin)?;
+    let (ota_code, ota_body) = http_request(
+        &host_port,
+        "POST",
+        "/api/ota",
+        &[("X-VVDrop-Token", &token_hex)],
+        signed_fw,
+    )?;
+    let msg = String::from_utf8_lossy(&ota_body).trim().to_string();
+    if ota_code != 200 {
+        return Err(format!("OTA rejected (HTTP {ota_code}): {msg}"));
+    }
+    Ok(msg)
 }

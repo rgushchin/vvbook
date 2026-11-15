@@ -10,9 +10,9 @@ use vvbook_security::AtomicJournal;
 use vvbook_x3_hal::epd::{NATIVE_ROW_BYTES, X3EpdPlanes, portrait_to_native};
 use vvbook_x3_hal::pins::{BQ27220_I2C_ADDR, DS3231_I2C_ADDR, QMI8658_I2C_ADDR};
 use vvbook_x3_hal::{
-    AdcButtonDecoder, Bq27220, DelayUs, Ds3231, EpdPins, EpdSilicon, Fat32Volume, HalError,
-    I2cBus, Qmi8658, SdControlPins, SpiBus, SpiSdhcCard, X3EpdDriver, format_fat32,
-    probe_silicon,
+    ActivePowerGovernor, AdcButtonDecoder, Bq27220, CpuPowerMode, DelayUs, Ds3231, EpdPins,
+    EpdSilicon, Fat32Volume, HalError, I2cBus, Qmi8658, SdControlPins, SpiBus, SpiSdhcCard,
+    X3EpdDriver, format_fat32, probe_silicon,
 };
 
 #[derive(Default, Clone)]
@@ -717,4 +717,230 @@ fn fat32_streaming_append_multi_cluster_and_mbr_slot_two() {
         off += n;
     }
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn active_power_governor_holdoff_wifi_io_and_predebounce_touch() {
+    let mut gov = ActivePowerGovernor::new(100);
+    assert_eq!(gov.current_mode(), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.current_mode().awake_mhz(), 160);
+    assert_eq!(gov.current_mode().idle_apb_mhz(), 80);
+    assert!(!gov.current_mode().uses_wfi());
+
+    // Stay in Turbo throughout the 250 ms boot UI holdoff window.
+    assert_eq!(gov.select_mode(349, false, false), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.eco_entries(), 0);
+
+    // Wi-Fi or pending continuous work keeps Turbo pinned even past 250 ms.
+    assert_eq!(gov.select_mode(350, true, false), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.select_mode(350, false, true), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.eco_entries(), 0);
+
+    // Once holdoff expires and Wi-Fi is off -> Eco XTAL + WFI.
+    let eco = gov.select_mode(350, false, false);
+    assert_eq!(eco, CpuPowerMode::EcoXtal40MHz);
+    assert_eq!(eco.awake_mhz(), 40);
+    assert_eq!(eco.idle_apb_mhz(), 20);
+    assert!(eco.uses_wfi());
+    assert_eq!(gov.eco_entries(), 1);
+    assert_eq!(gov.select_mode(5_000, false, false), CpuPowerMode::EcoXtal40MHz);
+    assert_eq!(gov.eco_entries(), 1);
+
+    // Raw touch/UI input re-boosts immediately to 160 MHz for UI_HOLDOFF_MS (250 ms).
+    gov.note_input(5_050, false);
+    assert_eq!(gov.current_mode(), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.turbo_boosts(), 1);
+    assert_eq!(gov.boost_until_ms(), 5_300);
+    assert_eq!(gov.select_mode(5_299, false, false), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.select_mode(5_300, false, false), CpuPowerMode::EcoXtal40MHz);
+    assert_eq!(gov.eco_entries(), 2);
+
+    // Clean Reading mode input scales back down after READER_HOLDOFF_MS (50 ms).
+    gov.note_input(6_000, true);
+    assert_eq!(gov.current_mode(), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.turbo_boosts(), 2);
+    assert_eq!(gov.boost_until_ms(), 6_050);
+    assert_eq!(gov.select_mode(6_049, false, false), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.select_mode(6_050, false, false), CpuPowerMode::EcoXtal40MHz);
+    assert_eq!(gov.eco_entries(), 3);
+
+    // Entering clean Reading mode clamps any leftover 250 ms UI holdoff down to 50 ms.
+    gov.note_input(7_000, false);
+    assert_eq!(gov.boost_until_ms(), 7_250);
+    gov.note_input(7_020, true);
+    assert_eq!(gov.boost_until_ms(), 7_070);
+    assert_eq!(gov.select_mode(7_069, false, false), CpuPowerMode::Turbo160MHz);
+    assert_eq!(gov.select_mode(7_070, false, false), CpuPowerMode::EcoXtal40MHz);
+    assert_eq!(gov.eco_entries(), 4);
+
+    // AdcButtonDecoder::has_active_or_pending triggers on very first raw dip before 14 ms debounce.
+    let mut dec = AdcButtonDecoder::new();
+    let mut out = Vec::new();
+    dec.poll_into(1_000, 3100, 3100, false, &mut out);
+    assert!(!dec.has_active_or_pending());
+    dec.poll_into(1_001, 250, 3100, false, &mut out); // raw Right dip
+    assert!(dec.has_active_or_pending());
+    assert!(out.is_empty()); // still pre-debounce
+    dec.poll_into(1_020, 250, 3100, false, &mut out);
+    assert!(dec.has_active_or_pending());
+    assert_eq!(out, vec![InputEvent::Press(Button::Right)]);
+    out.clear();
+    dec.poll_into(1_021, 3100, 3100, false, &mut out);
+    assert!(dec.has_active_or_pending()); // held stable while release debounces
+    dec.poll_into(1_040, 3100, 3100, false, &mut out);
+    assert!(!dec.has_active_or_pending());
+    assert_eq!(out, vec![InputEvent::Release(Button::Right)]);
+}
+
+#[test]
+fn adc_buttons_suppress_screen_transition_hold_and_ladder_slew() {
+    let mut dec = AdcButtonDecoder::new();
+    let idle = 3100;
+    let mut out = Vec::new();
+
+    // 1. User presses Confirm (2065 mV) to open a book, then keeps holding Confirm
+    // past the 650 ms long-press threshold after screen transition suppression.
+    dec.poll_into(0, 2065, idle, false, &mut out);
+    dec.poll_into(20, 2065, idle, false, &mut out);
+    assert_eq!(out, vec![InputEvent::Press(Button::Confirm)]);
+    out.clear();
+
+    dec.suppress_until_idle(20, 320);
+    for t in (100..=800).step_by(20) {
+        dec.poll_into(t, 2065, idle, false, &mut out);
+    }
+    assert!(
+        out.is_empty(),
+        "held Confirm across screen transition leaked events: {out:?}"
+    );
+
+    // Late release at t=820 followed by a release bounce at t=860 (within 80 ms):
+    // must be swallowed cleanly without synthesizing a Confirm press.
+    dec.poll_into(820, idle, idle, false, &mut out);
+    dec.poll_into(840, idle, idle, false, &mut out);
+    dec.poll_into(860, 2065, idle, false, &mut out);
+    dec.poll_into(880, 2065, idle, false, &mut out);
+    dec.poll_into(900, idle, idle, false, &mut out);
+    dec.poll_into(920, idle, idle, false, &mut out);
+    assert!(out.is_empty(), "post-release bounce leaked events: {out:?}");
+
+    // Fresh deliberate Confirm press once settled (past t=880+80 -> e.g. t=1020) works normally.
+    dec.poll_into(1_020, 2065, idle, false, &mut out);
+    dec.poll_into(1_040, 2065, idle, false, &mut out);
+    assert_eq!(out, vec![InputEvent::Press(Button::Confirm)]);
+    out.clear();
+    dec.poll_into(1_060, idle, idle, false, &mut out);
+    dec.poll_into(1_080, idle, idle, false, &mut out);
+    assert_eq!(out, vec![InputEvent::Release(Button::Confirm)]);
+    out.clear();
+
+    // 2. Return-to-Idle gate: slow resistor-ladder release from Left (1146 mV) through
+    // Confirm (2065 mV) -> Back (2710 mV) -> Idle (3100 mV) emits ONLY Release(Left).
+    dec.poll_into(2_000, 1146, idle, false, &mut out);
+    dec.poll_into(2_020, 1146, idle, false, &mut out);
+    assert_eq!(out, vec![InputEvent::Press(Button::Left)]);
+    out.clear();
+
+    dec.poll_into(2_040, 2065, idle, false, &mut out);
+    dec.poll_into(2_060, 2065, idle, false, &mut out);
+    dec.poll_into(2_080, 2710, idle, false, &mut out);
+    dec.poll_into(2_100, 2710, idle, false, &mut out);
+    dec.poll_into(2_120, idle, idle, false, &mut out);
+    dec.poll_into(2_140, idle, idle, false, &mut out);
+    assert_eq!(
+        out,
+        vec![InputEvent::Release(Button::Left)],
+        "ladder slew synthesized spurious key press: {out:?}"
+    );
+}
+
+#[test]
+fn fat32_remove_rejects_directory_preserves_eod_and_rejects_malformed_bpb() {
+    use vvbook_pal::{StorageBackend, StorageError};
+    use vvbook_x3_hal::BlockDevice;
+
+    struct VecCard(Vec<[u8; 512]>);
+    impl VecCard {
+        fn new(sectors: usize) -> Self {
+            Self(vec![[0u8; 512]; sectors])
+        }
+    }
+    impl BlockDevice for VecCard {
+        fn sector_count(&self) -> u32 {
+            self.0.len() as u32
+        }
+        fn read_sector(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), HalError> {
+            let s = self.0.get(lba as usize).ok_or(HalError::Bus)?;
+            *buf = *s;
+            Ok(())
+        }
+        fn write_sector(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), HalError> {
+            let s = self.0.get_mut(lba as usize).ok_or(HalError::Bus)?;
+            *s = *buf;
+            Ok(())
+        }
+    }
+
+    // 1. Directory removal must return Err(InvalidPath) without freeing child files.
+    let total_sectors = 65_536u32;
+    let mut card = VecCard::new(total_sectors as usize);
+    format_fat32(&mut card, total_sectors, b"VVBOOK_TEST").unwrap();
+    let mut vol = Fat32Volume::mount(card).unwrap();
+    vol.mkdir_all("/books/shelf").unwrap();
+    vol.write_all("/books/shelf/a.txt", b"safe-content").unwrap();
+    assert_eq!(vol.remove("/books/shelf"), Err(StorageError::InvalidPath));
+    assert_eq!(vol.remove("/books"), Err(StorageError::InvalidPath));
+    assert_eq!(vol.read_all("/books/shelf/a.txt").unwrap(), b"safe-content");
+
+    // 2. Inject a stale SFN entry after the root directory's 0x00 EOD marker and allocate across EOD.
+    let mut dev2 = VecCard::new(total_sectors as usize);
+    format_fat32(&mut dev2, total_sectors, b"VVTEST_EOD2").unwrap();
+    // Locate root directory LBA from MBR -> VBR.
+    let mut mbr = [0u8; 512];
+    dev2.read_sector(0, &mut mbr).unwrap();
+    let part_lba = u32::from_le_bytes(mbr[454..458].try_into().unwrap());
+    let mut vbr = [0u8; 512];
+    dev2.read_sector(part_lba, &mut vbr).unwrap();
+    let rsvd = u16::from_le_bytes([vbr[14], vbr[15]]) as u32;
+    let num_fats = vbr[16] as u32;
+    let fat_sz32 = u32::from_le_bytes(vbr[36..40].try_into().unwrap());
+    let sec_per_clus = vbr[13] as u32;
+    let root_clus = u32::from_le_bytes(vbr[44..48].try_into().unwrap());
+    let root_lba = part_lba + rsvd + num_fats * fat_sz32 + (root_clus - 2) * sec_per_clus;
+
+    // Volume label occupies slot 0; plant a valid-looking stale SFN at slot 5 (offset 160), leaving slot 1 == 0x00 (EOD).
+    let mut root_sec = [0u8; 512];
+    dev2.read_sector(root_lba, &mut root_sec).unwrap();
+    assert_eq!(root_sec[32], 0x00);
+    let stale_off = 5 * 32;
+    root_sec[stale_off..stale_off + 11].copy_from_slice(b"GHOST   TXT");
+    root_sec[stale_off + 11] = 0x20;
+    root_sec[stale_off + 26..stale_off + 28].copy_from_slice(&root_clus.to_le_bytes()[..2]);
+    dev2.write_sector(root_lba, &root_sec).unwrap();
+
+    let mut vol3 = Fat32Volume::mount(dev2).unwrap();
+    assert!(!vol3.exists("/ghost.txt"));
+    // Creating a long-named file needs > 4 slots (consumes slot 1..=5, crossing EOD and stale slot 5!).
+    vol3.write_all("/long_filename_crossing_stale_eod.txt", b"ok").unwrap();
+    let names: Vec<String> = vol3
+        .list_dir("/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_ascii_lowercase())
+        .collect();
+    assert!(!names.iter().any(|n| n.contains("ghost")), "stale entry resurrected: {names:?}");
+    assert!(names.iter().any(|n| n == "long_filename_crossing_stale_eod.txt"));
+
+    // 3. Overflowing FAT32 BPB fields must fail cleanly with StorageError::Corrupted.
+    let mut bad_card = VecCard::new(total_sectors as usize);
+    format_fat32(&mut bad_card, total_sectors, b"VVTEST_BAD1").unwrap();
+    let mut bad_mbr = [0u8; 512];
+    bad_card.read_sector(0, &mut bad_mbr).unwrap();
+    let bad_part_lba = u32::from_le_bytes(bad_mbr[454..458].try_into().unwrap());
+    let mut bad_vbr = [0u8; 512];
+    bad_card.read_sector(bad_part_lba, &mut bad_vbr).unwrap();
+    // fat_sz32 = 0x0200_0000 overflows `fat_sz32 * 128` in unchecked u32 arithmetic.
+    bad_vbr[36..40].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+    bad_card.write_sector(bad_part_lba, &bad_vbr).unwrap();
+    assert!(matches!(Fat32Volume::mount(bad_card), Err(StorageError::Corrupted)));
 }

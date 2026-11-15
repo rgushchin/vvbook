@@ -4,8 +4,8 @@ use std::env;
 use std::fs;
 use std::process;
 use vvbook_cli::{
-    convert_bytes_to_vvb, generate_ed25519_keypair, send_file_over_http, sign_firmware_bytes,
-    verify_firmware_bytes,
+    convert_bytes_to_vvb, generate_ed25519_keypair, send_file_over_http, send_ota_over_http,
+    sign_firmware_bytes, verify_firmware_bytes,
 };
 
 fn usage() -> ! {
@@ -13,7 +13,8 @@ fn usage() -> ! {
         "vvbook-cli — VVBook Folio OS document & security companion\n\
          Usage:\n\
          \tvvbook-cli convert <input> -o <output.vvb>\n\
-         \tvvbook-cli send <input> --url <http://host:port> --pin <6digits>\n\
+         \tvvbook-cli send <input> --url <http://host:port> --pin <8digits>\n\
+         \tvvbook-cli send-ota <signed.vvfw> --pin <8digits> [--host 192.168.4.1:80]\n\
          \tvvbook-cli keygen -o <key_prefix>\n\
          \tvvbook-cli sign-fw <fw.bin> -k <key.sec> -v <version> -o <out.vvfw>\n\
          \tvvbook-cli verify-fw <in.vvfw> -p <key.pub> [--min-version N]"
@@ -58,10 +59,26 @@ fn run() -> Result<(), String> {
                 .windows(2)
                 .find(|w| w[0] == "--pin")
                 .map(|w| w[1].clone())
-                .ok_or("missing --pin <6digits>")?;
+                .ok_or("missing --pin <8digits>")?;
             let raw = fs::read(input).map_err(|e| format!("read {input}: {e}"))?;
             send_file_over_http(&url, &pin, input, &raw)?;
             println!("Delivered '{input}' to {url}");
+        }
+        "send-ota" => {
+            let input = args.get(2).ok_or("missing <signed.vvfw>")?;
+            let host = args
+                .windows(2)
+                .find(|w| w[0] == "--host")
+                .map(|w| w[1].clone())
+                .unwrap_or_else(|| "192.168.4.1:80".to_string());
+            let pin = args
+                .windows(2)
+                .find(|w| w[0] == "--pin")
+                .map(|w| w[1].clone())
+                .ok_or("missing --pin <8digits>")?;
+            let raw = fs::read(input).map_err(|e| format!("read {input}: {e}"))?;
+            let msg = send_ota_over_http(&host, &pin, &raw)?;
+            println!("OTA delivered to {host}: {msg}");
         }
         "keygen" => {
             let prefix = args

@@ -1932,17 +1932,14 @@ impl FolioApp {
                         self.persistence_dirty = true;
                         self.redraw(sink, mode, power);
                     }
-                    return;
                 } else if self.screen == Screen::Library {
                     self.library_notice = None;
                     power.set_sd_power_save(false);
                     self.scan_and_ingest_books(storage);
                     power.set_sd_power_save(true);
                     self.redraw(sink, RefreshMode::HalfScrub, power);
-                    return;
-                } else {
-                    Button::Confirm
                 }
+                return;
             }
             InputEvent::LongPress(Button::Left | Button::Up)
                 if self.screen == Screen::Library && !self.catalog.is_empty() =>
@@ -2137,8 +2134,7 @@ impl FolioApp {
                                 self.pip.award_reading_starberry();
                             }
                             self.load_current_page_with_prefetch(storage, power);
-                            self.persistence_dirty = true;
-                            self.pending_journal_turns += 1;
+                            self.pending_journal_turns = self.pending_journal_turns.saturating_add(1);
                             if self.pending_journal_turns >= 10 {
                                 self.persistence_dirty = false;
                                 self.flush_persistence(storage, power);
@@ -2164,7 +2160,11 @@ impl FolioApp {
                         };
                         if turned {
                             self.load_current_page_with_prefetch(storage, power);
-                            self.persistence_dirty = true;
+                            self.pending_journal_turns = self.pending_journal_turns.saturating_add(1);
+                            if self.pending_journal_turns >= 10 {
+                                self.persistence_dirty = false;
+                                self.flush_persistence(storage, power);
+                            }
                             let mode = self.interactive_refresh_mode();
                             self.redraw(sink, mode, power);
                         }
@@ -2522,6 +2522,49 @@ impl FolioApp {
         power.enter_deep_sleep();
     }
 
+    /// Returns `true` when viewing a book page with no HUD or TOC overlay open.
+    pub const fn is_clean_reading_mode(&self) -> bool {
+        matches!(self.screen, Screen::Reader) && matches!(self.reader_overlay, ReaderOverlay::None)
+    }
+
+    /// Returns `true` if calling [`Self::tick`] at `now_ms` will execute SPI2, I2C,
+    /// Wi-Fi, or sleep hardware transactions requiring `160 MHz` PLL clocks.
+    pub fn tick_needs_io(&self, now_ms: u64) -> bool {
+        if self.screen == Screen::VvDrop {
+            return true;
+        }
+        if self.screen == Screen::SleepPoster {
+            return false;
+        }
+        let idle_ms = now_ms.saturating_sub(self.last_activity_ms);
+        let lookahead_idle_ms = idle_ms.saturating_add(5);
+        if self.screen == Screen::Reader
+            && !self.power_stats.panel_hv_standby
+            && self.pending_layout_anchor.is_some()
+        {
+            return true;
+        }
+        if self.persistence_dirty && lookahead_idle_ms >= 1_500 {
+            return true;
+        }
+        if self.pending_journal_turns > 0 && lookahead_idle_ms >= 30_000 {
+            return true;
+        }
+        if lookahead_idle_ms >= 2_500 && !self.power_stats.panel_hv_standby {
+            return true;
+        }
+        if lookahead_idle_ms >= 60_000 && self.power_stats.imu_powered {
+            return true;
+        }
+        let sleep_ms = self.auto_sleep_mins as u64 * 60_000;
+        lookahead_idle_ms >= sleep_ms
+    }
+
+    /// Returns `true` only when continuous high-rate polling (`Screen::VvDrop` Wi-Fi) is active.
+    pub fn has_pending_background_work(&self) -> bool {
+        self.screen == Screen::VvDrop
+    }
+
     /// Periodic background tick (~200ms - 1000ms) running the **3-Stage Battery Governor**
     /// and polling VVDrop uploads only while `Screen::VvDrop` is open.
     pub fn tick<D, S, E, P, W>(
@@ -2639,8 +2682,10 @@ impl FolioApp {
             self.extend_pending_pagination(storage, power, 24);
         }
 
-        // Flush deferred catalog/journal writes calmly after 1.5s of user idle
-        if self.persistence_dirty && idle_ms >= 1_500 {
+        // Flush deferred catalog/journal writes calmly after 1.5s of UI idle, or after a 30s reading pause
+        if (self.persistence_dirty && idle_ms >= 1_500)
+            || (self.pending_journal_turns > 0 && idle_ms >= 30_000)
+        {
             self.persistence_dirty = false;
             self.flush_persistence(storage, power);
         }

@@ -370,8 +370,17 @@ struct Fat32Geo {
 }
 
 impl Fat32Geo {
-    fn cluster_lba(&self, clus: u32) -> u32 {
-        self.data_start_lba + (clus - 2) * u32::from(self.sec_per_clus)
+    fn cluster_lba(&self, clus: u32) -> Result<u32, StorageError> {
+        let idx = clus.checked_sub(2).ok_or(StorageError::Corrupted)?;
+        if idx >= self.total_clusters {
+            return Err(StorageError::Corrupted);
+        }
+        let sec_off = idx
+            .checked_mul(u32::from(self.sec_per_clus))
+            .ok_or(StorageError::Corrupted)?;
+        self.data_start_lba
+            .checked_add(sec_off)
+            .ok_or(StorageError::Corrupted)
     }
 }
 
@@ -462,16 +471,52 @@ impl<B: BlockDevice> Fat32Volume<B> {
         let fat_sz32 = u32::from_le_bytes([sec[36], sec[37], sec[38], sec[39]]);
         let root_clus = u32::from_le_bytes([sec[44], sec[45], sec[46], sec[47]]);
 
-        let fat0_lba = part_lba + u32::from(rsvd_sec_cnt);
-        let data_start_lba = fat0_lba + u32::from(num_fats) * fat_sz32;
-        let data_sectors = total_sec32.saturating_sub(u32::from(rsvd_sec_cnt) + u32::from(num_fats) * fat_sz32);
-        let total_clusters = (data_sectors / u32::from(sec_per_clus)).min(fat_sz32 * 128 - 2);
+        let rsvd = u32::from(rsvd_sec_cnt);
+        let fats_total_secs = u32::from(num_fats)
+            .checked_mul(fat_sz32)
+            .ok_or(StorageError::Corrupted)?;
+        let fat0_lba = part_lba
+            .checked_add(rsvd)
+            .ok_or(StorageError::Corrupted)?;
+        let data_start_lba = fat0_lba
+            .checked_add(fats_total_secs)
+            .ok_or(StorageError::Corrupted)?;
+        let header_secs = rsvd
+            .checked_add(fats_total_secs)
+            .ok_or(StorageError::Corrupted)?;
+        let data_sectors = total_sec32
+            .checked_sub(header_secs)
+            .ok_or(StorageError::Corrupted)?;
+        let max_by_data = u64::from(data_sectors / u32::from(sec_per_clus));
+        let max_by_fat = u64::from(fat_sz32)
+            .checked_mul(128)
+            .and_then(|n| n.checked_sub(2))
+            .ok_or(StorageError::Corrupted)?;
+        let total_clusters_u64 = max_by_data.min(max_by_fat);
+        if total_clusters_u64 == 0 || total_clusters_u64 > u64::from(u32::MAX - 2) {
+            return Err(StorageError::Corrupted);
+        }
+        let total_clusters = total_clusters_u64 as u32;
+        if root_clus < 2 || root_clus.saturating_sub(2) >= total_clusters {
+            return Err(StorageError::Corrupted);
+        }
+        u64::from(data_start_lba)
+            .checked_add(
+                u64::from(total_clusters)
+                    .checked_mul(u64::from(sec_per_clus))
+                    .ok_or(StorageError::Corrupted)?,
+            )
+            .filter(|&end| end <= u64::from(u32::MAX))
+            .ok_or(StorageError::Corrupted)?;
 
         let mut next_alloc_hint = 3u32;
         let fsinfo_sec = u16::from_le_bytes([sec[48], sec[49]]);
-        if fsinfo_sec != 0 && fsinfo_sec != 0xFFFF {
+        if fsinfo_sec != 0
+            && fsinfo_sec != 0xFFFF
+            && let Some(fsi_lba) = part_lba.checked_add(u32::from(fsinfo_sec))
+        {
             let mut fsi = [0u8; 512];
-            if dev.read_sector(part_lba + u32::from(fsinfo_sec), &mut fsi).is_ok()
+            if dev.read_sector(fsi_lba, &mut fsi).is_ok()
                 && fsi[0..4] == *b"RRaA"
                 && fsi[484..488] == *b"rrAa"
                 && fsi[510..512] == [0x55, 0xAA]
@@ -864,7 +909,7 @@ impl<B: BlockDevice> Fat32Volume<B> {
         let mut sec_buf = [0u8; 512];
         let mut offset = 0usize;
         for &c in &clusters {
-            let base_lba = self.geo.cluster_lba(c);
+            let base_lba = self.geo.cluster_lba(c)?;
             for s in 0..u32::from(self.geo.sec_per_clus) {
                 if offset >= data.len() {
                     break;
@@ -899,7 +944,7 @@ impl<B: BlockDevice> Fat32Volume<B> {
         let mut hops = 0usize;
         while (2..EOC_MIN).contains(&clus) && hops < 256 {
             hops += 1;
-            let base_lba = self.geo.cluster_lba(clus);
+            let base_lba = self.geo.cluster_lba(clus)?;
             for s in 0..u32::from(self.geo.sec_per_clus) {
                 let lba = base_lba + s;
                 self.cached_read_sector(dev, lba, &mut sec)?;
@@ -1035,7 +1080,7 @@ impl<B: BlockDevice> Fat32Volume<B> {
         let mut hops = 0usize;
         while (2..EOC_MIN).contains(&clus) && hops < 256 {
             hops += 1;
-            let base_lba = self.geo.cluster_lba(clus);
+            let base_lba = self.geo.cluster_lba(clus)?;
             for s in 0..u32::from(self.geo.sec_per_clus) {
                 let lba = base_lba + s;
                 self.cached_read_sector(dev, lba, &mut sec)?;
@@ -1196,24 +1241,62 @@ impl<B: BlockDevice> Fat32Volume<B> {
         let mut clus = dir_clus;
         let mut sec = [0u8; 512];
         let mut hops = 0u32;
+        let mut seen_eod = false;
 
         while (2..EOC_MIN).contains(&clus) && hops < 512 {
             hops += 1;
             last_clus = clus;
-            let base_lba = self.geo.cluster_lba(clus);
+            let base_lba = self.geo.cluster_lba(clus)?;
             for s in 0..u32::from(self.geo.sec_per_clus) {
                 let lba = base_lba + s;
                 self.cached_read_sector(dev, lba, &mut sec)?;
                 for i in 0..16 {
                     let off = i * 32;
-                    let first = sec[off];
-                    if first == 0x00 || first == 0xE5 {
+                    if seen_eod {
+                        // Every slot logically at-or-past 0x00 EOD is unallocated even if dirty bytes exist.
                         free_run.push((lba, off));
-                        if free_run.len() == need {
-                            return Ok(free_run);
-                        }
                     } else {
-                        free_run.clear();
+                        let first = sec[off];
+                        if first == 0x00 {
+                            seen_eod = true;
+                            free_run.push((lba, off));
+                        } else if first == 0xE5 {
+                            free_run.push((lba, off));
+                        } else {
+                            free_run.clear();
+                        }
+                    }
+
+                    if free_run.len() == need {
+                        if seen_eod {
+                            // Preserve the FAT32 0x00 EOD sentinel right after the newly consumed tail.
+                            if i + 1 < 16 {
+                                let next_off = (i + 1) * 32;
+                                if sec[next_off] != 0x00 {
+                                    sec[next_off] = 0x00;
+                                    self.cached_write_sector(dev, lba, &sec)?;
+                                }
+                            } else {
+                                let next_target = if s + 1 < u32::from(self.geo.sec_per_clus) {
+                                    Some(base_lba + s + 1)
+                                } else {
+                                    let nc = self.read_fat_entry(dev, clus)?;
+                                    if (2..EOC_MIN).contains(&nc) {
+                                        Some(self.geo.cluster_lba(nc)?)
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(next_lba) = next_target {
+                                    self.cached_read_sector(dev, next_lba, &mut sec)?;
+                                    if sec[0] != 0x00 {
+                                        sec[0] = 0x00;
+                                        self.cached_write_sector(dev, next_lba, &sec)?;
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(free_run);
                     }
                 }
             }
@@ -1223,12 +1306,12 @@ impl<B: BlockDevice> Fat32Volume<B> {
             return Err(StorageError::Corrupted);
         }
 
-        // Extend directory with a fresh zeroed cluster
+        // Extend directory with a fresh zeroed cluster (remaining trailing slots are already 0x00).
         let new_c = self.alloc_cluster(dev)?;
         self.write_fat_entry(dev, last_clus, new_c)?;
         self.write_fat_entry(dev, new_c, EOC_MARK)?;
         let zero = [0u8; 512];
-        let base_lba = self.geo.cluster_lba(new_c);
+        let base_lba = self.geo.cluster_lba(new_c)?;
         for s in 0..u32::from(self.geo.sec_per_clus) {
             let lba = base_lba + s;
             self.cached_write_sector(dev, lba, &zero)?;
@@ -1294,7 +1377,7 @@ impl<B: BlockDevice> Fat32Volume<B> {
         let mut copied = 0usize;
         let mut sec_buf = [0u8; 512];
         while copied < to_read && (2..EOC_MIN).contains(&clus) {
-            let base_lba = self.geo.cluster_lba(clus);
+            let base_lba = self.geo.cluster_lba(clus)?;
             let mut sec_idx = pos / 512;
             let mut in_sec = pos % 512;
             while sec_idx < usize::from(self.geo.sec_per_clus) && copied < to_read {
@@ -1453,7 +1536,7 @@ impl<B: BlockDevice> StorageBackend for Fat32Volume<B> {
         let mut offset = 0usize;
 
         if tail != 0 {
-            let base_lba = self.geo.cluster_lba(last_clus);
+            let base_lba = self.geo.cluster_lba(last_clus)?;
             let mut sec_idx = tail / 512;
             let mut in_sec = tail % 512;
             let mut sec_buf = [0u8; 512];
@@ -1498,6 +1581,9 @@ impl<B: BlockDevice> StorageBackend for Fat32Volume<B> {
     fn remove(&mut self, path: &str) -> Result<(), StorageError> {
         let mut dev = self.dev.borrow_mut();
         let ent = self.resolve_entry_opts(&mut dev, path, true)?;
+        if ent.is_dir {
+            return Err(StorageError::InvalidPath);
+        }
         self.invalidate_entry_cache();
         let mut sec = [0u8; 512];
         for &(lba, off) in &ent.entry_slots {
@@ -1525,7 +1611,7 @@ impl<B: BlockDevice> StorageBackend for Fat32Volume<B> {
                 let new_c = self.alloc_cluster(&mut dev)?;
                 self.write_fat_entry(&mut dev, new_c, EOC_MARK)?;
                 let mut zero = [0u8; 512];
-                let base_lba = self.geo.cluster_lba(new_c);
+                let base_lba = self.geo.cluster_lba(new_c)?;
                 for s in 0..u32::from(self.geo.sec_per_clus) {
                     if s == 0 {
                         // '.' and '..' entries in new directory cluster

@@ -12,10 +12,10 @@ use smoltcp::phy::Device;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration as NetDuration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
-use vvbook_pal::{DateTime, EntropySource, StorageBackend};
+use vvbook_pal::{DateTime, StagedOta, StorageBackend};
 use vvbook_security::{
-    HW_TARGET_XTEINK_X3, SignedFwHeader, StreamingFwVerifier, VvDropAuth, compute_auth_mac,
-    decode_hex_32, encode_hex,
+    Blake3Drbg, HW_TARGET_XTEINK_X3, MAX_ESP32C3_OTA_BYTES, SignedFwHeader, StreamingFwVerifier,
+    VvDropAuth, compute_auth_mac, decode_hex_32, encode_hex,
 };
 
 pub const AP_IPV4: [u8; 4] = [192, 168, 4, 1];
@@ -31,7 +31,7 @@ const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 const LEASE_SECONDS: u32 = 3600;
 const MAX_HTTP_HEADER_BYTES: usize = 4096;
 const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_OTA_BYTES: u64 = 7 * 1024 * 1024;
+const MAX_OTA_BYTES: u64 = SignedFwHeader::SIZE as u64 + MAX_ESP32C3_OTA_BYTES as u64;
 const OTA_STAGE_PATH: &str = "/.vvbook/ota_staged.bin";
 
 #[derive(Clone, Copy)]
@@ -451,28 +451,12 @@ pub fn parse_datetime_header(s: &str) -> Option<DateTime> {
     })
 }
 
-struct XorShift64(u64);
-
-impl EntropySource for XorShift64 {
-    fn fill_bytes(&mut self, out: &mut [u8]) {
-        for b in out.iter_mut() {
-            let mut x = self.0.max(1);
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            *b = (x >> 24) as u8;
-        }
-    }
-}
-
 /// Shared VVDrop portal session, access key auth, OTA verification key, and upload status.
 pub struct VvDropServerState {
     pub active: bool,
     pub pin: [u8; 8],
-    pub wpa2_authenticated_link: bool,
     pub auth: VvDropAuth,
-    pub rng_state: u64,
+    pub rng: Blake3Drbg,
     pub ota_pub_key: [u8; 32],
     pub min_fw_version: u32,
     pub clients_connected: u8,
@@ -482,20 +466,26 @@ pub struct VvDropServerState {
     pub busy_message: Option<String>,
     pub completed_uploads: Vec<String>,
     pub synced_datetime: Option<DateTime>,
+    pub staged_ota: Option<StagedOta>,
     pub status_dirty: bool,
     pub active_upload_path: Option<String>,
 }
 
 impl VvDropServerState {
     pub fn new(ota_pub_key: [u8; 32], min_fw_version: u32, seed: u64) -> Self {
-        let mut rng = XorShift64(seed ^ 0x9E37_79B9_7F4A_7C15);
+        let mut s = [0u8; 32];
+        s[..8].copy_from_slice(&(seed ^ 0x9E37_79B9_7F4A_7C15).to_le_bytes());
+        Self::new_with_entropy(ota_pub_key, min_fw_version, s)
+    }
+
+    pub fn new_with_entropy(ota_pub_key: [u8; 32], min_fw_version: u32, seed: [u8; 32]) -> Self {
+        let mut rng = Blake3Drbg::from_seed(seed);
         let auth = VvDropAuth::from_fixed_pin(*b"00000000", &mut rng);
         Self {
             active: false,
             pin: *b"00000000",
-            wpa2_authenticated_link: false,
             auth,
-            rng_state: rng.0,
+            rng,
             ota_pub_key,
             min_fw_version,
             clients_connected: 0,
@@ -505,12 +495,21 @@ impl VvDropServerState {
             busy_message: None,
             completed_uploads: Vec::new(),
             synced_datetime: None,
+            staged_ota: None,
             status_dirty: false,
             active_upload_path: None,
         }
     }
 
+    pub fn reseed(&mut self, extra: &[u8]) {
+        self.rng.reseed(extra);
+    }
+
     pub fn start(&mut self, pin: &str, seed_mix: u64) {
+        self.start_with_entropy(pin, &seed_mix.to_le_bytes());
+    }
+
+    pub fn start_with_entropy(&mut self, pin: &str, entropy: &[u8]) {
         let mut pb = [b'0'; 8];
         for (i, b) in pin
             .bytes()
@@ -521,10 +520,9 @@ impl VvDropServerState {
             pb[i] = b;
         }
         self.pin = pb;
-        self.rng_state = self.rng_state.wrapping_add(seed_mix ^ 0xA5A5_5A5A);
-        let mut rng = XorShift64(self.rng_state);
-        self.auth = VvDropAuth::from_fixed_pin(pb, &mut rng);
-        self.rng_state = rng.0;
+        self.rng.reseed(entropy);
+        self.rng.reseed(&pb);
+        self.auth = VvDropAuth::from_fixed_pin(pb, &mut self.rng);
         self.active = true;
         self.busy_message = None;
         self.status_dirty = true;
@@ -537,6 +535,10 @@ impl VvDropServerState {
         self.total_bytes = 0;
         self.busy_message = None;
         self.active_upload_path = None;
+    }
+
+    pub fn take_staged_ota(&mut self) -> Option<StagedOta> {
+        self.staged_ota.take()
     }
 }
 
@@ -619,6 +621,11 @@ impl StreamingHttpConn {
             }
             ConnStage::StreamingOtaHeader { .. } | ConnStage::StreamingOtaBody { .. } => {
                 let _ = storage.remove(OTA_STAGE_PATH);
+                if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                    state.active_upload_path = None;
+                }
+                state.rx_bytes = 0;
+                state.total_bytes = 0;
                 state.busy_message = None;
                 state.status_dirty = true;
             }
@@ -872,6 +879,10 @@ impl StreamingHttpConn {
                                 let _ = storage.mkdir_all("/.vvbook");
                                 let _ = storage.remove(OTA_STAGE_PATH);
                                 if storage.write_atomic(OTA_STAGE_PATH, &[]).is_err() {
+                                    if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                        state.active_upload_path = None;
+                                    }
+                                    state.busy_message = None;
                                     if rem > 0 {
                                         self.stage = ConnStage::DrainingBadBody {
                                             remaining: rem,
@@ -894,6 +905,14 @@ impl StreamingHttpConn {
                                     match verifier.finish() {
                                         Ok(hdr) => {
                                             state.min_fw_version = hdr.fw_version;
+                                            state.staged_ota = Some(StagedOta {
+                                                fw_version: hdr.fw_version,
+                                                payload_len: hdr.payload_len,
+                                                payload_blake3: hdr.payload_blake3,
+                                            });
+                                            if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                                state.active_upload_path = None;
+                                            }
                                             state.busy_message = None;
                                             state.status_dirty = true;
                                             self.queue_response_bytes(
@@ -906,6 +925,10 @@ impl StreamingHttpConn {
                                         }
                                         Err(e) => {
                                             let _ = storage.remove(OTA_STAGE_PATH);
+                                            if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                                state.active_upload_path = None;
+                                            }
+                                            state.busy_message = None;
                                             let msg = format!("OTA verify failed: {e:?}");
                                             self.queue_response_bytes(
                                                 403,
@@ -924,6 +947,10 @@ impl StreamingHttpConn {
                                 }
                             }
                             Err(e) => {
+                                if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                    state.active_upload_path = None;
+                                }
+                                state.busy_message = None;
                                 let msg = format!("OTA header rejected: {e:?}");
                                 if rem > 0 {
                                     self.stage = ConnStage::DrainingBadBody {
@@ -959,6 +986,10 @@ impl StreamingHttpConn {
                         let sd_res = storage.append(OTA_STAGE_PATH, &chunk[..take]);
                         if feed_res.is_err() || sd_res.is_err() {
                             let _ = storage.remove(OTA_STAGE_PATH);
+                            if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                state.active_upload_path = None;
+                            }
+                            state.busy_message = None;
                             if remaining > 0 {
                                 self.stage = ConnStage::DrainingBadBody {
                                     remaining,
@@ -981,6 +1012,14 @@ impl StreamingHttpConn {
                             match (*verifier).finish() {
                                 Ok(hdr) => {
                                     state.min_fw_version = hdr.fw_version;
+                                    state.staged_ota = Some(StagedOta {
+                                        fw_version: hdr.fw_version,
+                                        payload_len: hdr.payload_len,
+                                        payload_blake3: hdr.payload_blake3,
+                                    });
+                                    if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                        state.active_upload_path = None;
+                                    }
                                     state.busy_message = None;
                                     state.last_received_file = Some(String::from("ota_staged.bin"));
                                     state.status_dirty = true;
@@ -994,6 +1033,10 @@ impl StreamingHttpConn {
                                 }
                                 Err(e) => {
                                     let _ = storage.remove(OTA_STAGE_PATH);
+                                    if state.active_upload_path.as_deref() == Some(OTA_STAGE_PATH) {
+                                        state.active_upload_path = None;
+                                    }
+                                    state.busy_message = None;
                                     let msg = format!("OTA verify failed: {e:?}");
                                     self.queue_response_bytes(
                                         403,
@@ -1079,12 +1122,11 @@ impl StreamingHttpConn {
             return;
         }
 
-        if !state.active && path != "/api/ota" {
-            self.queue_response_bytes(
+        if !state.active {
+            self.reject_with_drain(
+                content_len.unwrap_or(0),
                 503,
                 "Service Unavailable",
-                "text/plain",
-                None,
                 b"VVDrop closed on device",
             );
             return;
@@ -1129,47 +1171,6 @@ impl StreamingHttpConn {
                 self.queue_response_bytes(200, "OK", "text/plain", None, hex.as_bytes());
             }
             ("POST", "/api/auth") => {
-                if let Some(dt_hdr) = hdr_val("x-vvdrop-datetime")
-                    && let Some(dt) = parse_datetime_header(dt_hdr)
-                {
-                    state.synced_datetime = Some(dt);
-                }
-                if hdr_val("x-vvdrop-wpa2-session") == Some("1") {
-                    if !state.wpa2_authenticated_link {
-                        self.queue_response_bytes(
-                            401,
-                            "Unauthorized",
-                            "text/plain",
-                            None,
-                            b"wpa2 session requires key",
-                        );
-                        return;
-                    }
-                    let mut rng = XorShift64(state.rng_state.wrapping_add(1337));
-                    let res = state.auth.issue_wpa2_session_token(&mut rng);
-                    state.rng_state = rng.0;
-                    match res {
-                        Ok(tok) => {
-                            self.queue_response_bytes(
-                                200,
-                                "OK",
-                                "text/plain",
-                                None,
-                                encode_hex(&tok).as_bytes(),
-                            );
-                        }
-                        Err(_) => {
-                            self.queue_response_bytes(
-                                423,
-                                "Locked",
-                                "text/plain",
-                                None,
-                                b"locked out",
-                            );
-                        }
-                    }
-                    return;
-                }
                 let Some(cn_hex) = hdr_val("x-vvdrop-client-nonce") else {
                     self.queue_response_bytes(400, "Bad Request", "text/plain", None, b"missing client nonce");
                     return;
@@ -1197,11 +1198,14 @@ impl StreamingHttpConn {
                     return;
                 };
 
-                let mut rng = XorShift64(state.rng_state.wrapping_add(1337));
-                let res = state.auth.verify_and_issue_token(&cn, &mac, &mut rng);
-                state.rng_state = rng.0;
+                let res = state.auth.verify_and_issue_token(&cn, &mac, &mut state.rng);
                 match res {
                     Ok(tok) => {
+                        if let Some(dt_hdr) = hdr_val("x-vvdrop-datetime")
+                            && let Some(dt) = parse_datetime_header(dt_hdr)
+                        {
+                            state.synced_datetime = Some(dt);
+                        }
                         self.queue_response_bytes(
                             200,
                             "OK",
@@ -1281,10 +1285,27 @@ impl StreamingHttpConn {
             }
             ("POST", "/api/ota") => {
                 let total = content_len.unwrap_or(0);
+                let Some(tok_hex) = hdr_val("x-vvdrop-token") else {
+                    self.reject_with_drain(total, 401, "Unauthorized", b"unauthorized");
+                    return;
+                };
+                let Some(tok) = decode_hex_32(tok_hex) else {
+                    self.reject_with_drain(total, 401, "Unauthorized", b"unauthorized");
+                    return;
+                };
+                if state.auth.verify_token(&tok).is_err() {
+                    self.reject_with_drain(total, 401, "Unauthorized", b"unauthorized");
+                    return;
+                }
                 if total < SignedFwHeader::SIZE as u64 || total > MAX_OTA_BYTES {
                     self.reject_with_drain(total, 400, "Bad Request", b"invalid ota size");
                     return;
                 }
+                if state.active_upload_path.is_some() {
+                    self.reject_with_drain(total, 409, "Conflict", b"another upload in progress");
+                    return;
+                }
+                state.active_upload_path = Some(String::from(OTA_STAGE_PATH));
                 if expect_continue {
                     self.tx_head = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
                     self.tx_head_pos = 0;
@@ -1527,19 +1548,18 @@ impl SmoltcpPortalEngine {
             )));
         });
 
-        let sock_storage = Box::leak(Box::new([const { SocketStorage::EMPTY }; 2 + HTTP_SLOT_COUNT]));
-        let mut sockets = SocketSet::new(&mut sock_storage[..]);
+        let sock_storage: Vec<SocketStorage<'static>> =
+            (0..2 + HTTP_SLOT_COUNT).map(|_| SocketStorage::EMPTY).collect();
+        let mut sockets = SocketSet::new(sock_storage);
 
         let make_udp = |rx_pkts: usize, rx_bytes: usize, tx_pkts: usize, tx_bytes: usize, port: u16| {
+            let rx_meta: Vec<udp::PacketMetadata> =
+                (0..rx_pkts).map(|_| udp::PacketMetadata::EMPTY).collect();
+            let tx_meta: Vec<udp::PacketMetadata> =
+                (0..tx_pkts).map(|_| udp::PacketMetadata::EMPTY).collect();
             let mut s = udp::Socket::new(
-                udp::PacketBuffer::new(
-                    Box::leak(vec![udp::PacketMetadata::EMPTY; rx_pkts].into_boxed_slice()),
-                    Box::leak(vec![0u8; rx_bytes].into_boxed_slice()),
-                ),
-                udp::PacketBuffer::new(
-                    Box::leak(vec![udp::PacketMetadata::EMPTY; tx_pkts].into_boxed_slice()),
-                    Box::leak(vec![0u8; tx_bytes].into_boxed_slice()),
-                ),
+                udp::PacketBuffer::new(rx_meta, vec![0u8; rx_bytes]),
+                udp::PacketBuffer::new(tx_meta, vec![0u8; tx_bytes]),
             );
             let _ = s.bind(port);
             s
@@ -1549,8 +1569,8 @@ impl SmoltcpPortalEngine {
 
         let make_tcp = |rx_len: usize, tx_len: usize| {
             let mut s = tcp::Socket::new(
-                tcp::SocketBuffer::new(Box::leak(vec![0u8; rx_len].into_boxed_slice())),
-                tcp::SocketBuffer::new(Box::leak(vec![0u8; tx_len].into_boxed_slice())),
+                tcp::SocketBuffer::new(vec![0u8; rx_len]),
+                tcp::SocketBuffer::new(vec![0u8; tx_len]),
             );
             s.set_nagle_enabled(false);
             s.set_ack_delay(None);
@@ -1579,6 +1599,13 @@ impl SmoltcpPortalEngine {
     /// Update the SoftAP Ethernet hardware MAC address after AP startup.
     pub fn set_hardware_addr(&mut self, mac: [u8; 6]) {
         self.iface.set_hardware_addr(EthernetAddress(mac).into());
+    }
+
+    /// Returns `true` while any HTTP socket still has unsent response bytes queued.
+    pub fn has_active_http_tx(&self) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.conn.has_tx() || self.sockets.get::<tcp::Socket<'_>>(slot.handle).send_queue() > 0
+        })
     }
 
     /// Abort active TCP connections cleanly (cleaning up any staged upload via `storage`) and re-listen.
@@ -1900,28 +1927,28 @@ mod tests {
         let resp_fav = drain_tx(&mut conn);
         assert!(resp_fav.starts_with("HTTP/1.1 204 No Content"));
 
-        // 1c. X-VVDrop-Wpa2-Session rejected (401) when wpa2_authenticated_link == false, accepted when true
+        // 1c. Legacy X-VVDrop-Wpa2-Session bypass header is permanently rejected without issuing a token
         conn.reset();
         conn.on_rx(
-            b"POST /api/auth HTTP/1.1\r\nX-VVDrop-Wpa2-Session: 1\r\nContent-Length: 0\r\n\r\n",
+            b"POST /api/auth HTTP/1.1\r\nX-VVDrop-Wpa2-Session: 1\r\nX-VVDrop-Datetime: 2026-11-13 09:00:00\r\nContent-Length: 0\r\n\r\n",
             &mut state,
             &mut store,
         );
         let wpa_denied = drain_tx(&mut conn);
-        assert!(wpa_denied.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(wpa_denied.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(state.synced_datetime.is_none(), "unauthenticated request must not sync clock");
         assert_eq!(state.auth.failed_attempts(), 0);
 
-        state.wpa2_authenticated_link = true;
+        // 1d. Failed PIN auth with X-VVDrop-Datetime must NOT mutate synced_datetime
         conn.reset();
         conn.on_rx(
-            b"POST /api/auth HTTP/1.1\r\nX-VVDrop-Wpa2-Session: 1\r\nContent-Length: 0\r\n\r\n",
+            b"POST /api/auth HTTP/1.1\r\nX-VVDrop-Pin: 00000000\r\nX-VVDrop-Client-Nonce: 5555555555555555555555555555555555555555555555555555555555555555\r\nX-VVDrop-Datetime: 2026-11-13 09:00:00\r\nContent-Length: 0\r\n\r\n",
             &mut state,
             &mut store,
         );
-        let wpa_ok = drain_tx(&mut conn);
-        assert!(wpa_ok.starts_with("HTTP/1.1 200 OK"));
-        let wpa_tok = decode_hex_32(wpa_ok.split("\r\n\r\n").nth(1).unwrap().trim()).unwrap();
-        assert!(state.auth.verify_token(&wpa_tok).is_ok());
+        let bad_pin_resp = drain_tx(&mut conn);
+        assert!(bad_pin_resp.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(state.synced_datetime.is_none());
 
         // 2. GET /api/nonce -> POST /api/auth with X-VVDrop-Datetime
         conn.reset();
@@ -1978,7 +2005,7 @@ mod tests {
         assert!(!store.exists("/books/evil.epub"));
         assert!(state.active_upload_path.is_none());
 
-        // 5. Signed Ed25519 OTA upload
+        // 5. Signed Ed25519 OTA upload requires active portal + valid session token
         let fw_payload = b"ESP32C3_FW_V2_STREAM_VERIFIED_OK";
         let mut hdr = SignedFwHeader {
             format_ver: vvbook_security::VVFW_FORMAT_VERSION,
@@ -1994,9 +2021,36 @@ mod tests {
         let mut ota_body = hdr.to_bytes().to_vec();
         ota_body.extend_from_slice(fw_payload);
 
+        // 5a. Inactive portal blocks /api/ota with 503
+        state.active = false;
+        conn.reset();
+        let ota_closed = format!(
+            "POST /api/ota HTTP/1.1\r\nX-VVDrop-Token: {tok_hex}\r\nContent-Length: {}\r\n\r\n",
+            ota_body.len()
+        );
+        conn.on_rx(ota_closed.as_bytes(), &mut state, &mut store);
+        for slice in ota_body.chunks(64) {
+            conn.on_rx(slice, &mut state, &mut store);
+        }
+        assert!(drain_tx(&mut conn).starts_with("HTTP/1.1 503 Service Unavailable"));
+        state.active = true;
+
+        // 5b. Active portal without valid token rejects /api/ota with 401
+        conn.reset();
+        let ota_unauth = format!(
+            "POST /api/ota HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            ota_body.len()
+        );
+        conn.on_rx(ota_unauth.as_bytes(), &mut state, &mut store);
+        for slice in ota_body.chunks(64) {
+            conn.on_rx(slice, &mut state, &mut store);
+        }
+        assert!(drain_tx(&mut conn).starts_with("HTTP/1.1 401 Unauthorized"));
+
+        // 5c. Authenticated PIN token succeeds 200 OK and populates take_staged_ota()
         conn.reset();
         let ota_hdr = format!(
-            "POST /api/ota HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            "POST /api/ota HTTP/1.1\r\nX-VVDrop-Token: {tok_hex}\r\nContent-Length: {}\r\n\r\n",
             ota_body.len()
         );
         conn.on_rx(ota_hdr.as_bytes(), &mut state, &mut store);
@@ -2006,6 +2060,10 @@ mod tests {
         let ota_resp = drain_tx(&mut conn);
         assert!(ota_resp.starts_with("HTTP/1.1 200 OK"), "got {ota_resp}");
         assert_eq!(state.min_fw_version, 2);
+        let staged = state.take_staged_ota().expect("staged_ota must be recorded");
+        assert_eq!(staged.fw_version, 2);
+        assert_eq!(staged.payload_len, fw_payload.len() as u32);
+        assert_eq!(staged.payload_blake3, *blake3::hash(fw_payload).as_bytes());
         assert_eq!(store.read_all(OTA_STAGE_PATH).unwrap(), fw_payload);
     }
 
@@ -2144,7 +2202,6 @@ mod tests {
         let mut engine = SmoltcpPortalEngine::new(&mut ap_dev, ap_mac, 777, now_ms);
         let mut state = VvDropServerState::new([1u8; 32], 1, 42);
         state.start("48291037", 99);
-        state.wpa2_authenticated_link = true;
         let mut dhcp = DhcpServer::new();
         let mut store = MemStore::default();
 
@@ -2286,7 +2343,7 @@ mod tests {
             Some(b"GET / HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n"),
             Some(b"GET /favicon.ico HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n"),
             Some(
-                b"POST /api/auth HTTP/1.1\r\nHost: 192.168.4.1\r\nX-VVDrop-Wpa2-Session: 1\r\nX-VVDrop-Datetime: 2026-11-14 01:30:00\r\nContent-Length: 0\r\n\r\n",
+                b"POST /api/auth HTTP/1.1\r\nHost: 192.168.4.1\r\nX-VVDrop-Pin: 48291037\r\nX-VVDrop-Client-Nonce: 1111111111111111111111111111111111111111111111111111111111111111\r\nX-VVDrop-Datetime: 2026-11-14 01:30:00\r\nContent-Length: 0\r\n\r\n",
             ),
         ];
         for (i, req) in reqs.iter().enumerate() {

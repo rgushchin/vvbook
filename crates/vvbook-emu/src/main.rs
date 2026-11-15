@@ -14,6 +14,7 @@ use vvbook_emu::{
     export_all_snapshots, seed_sample_library,
 };
 use vvbook_pal::{Button, InputEvent, PORTRAIT_H, PORTRAIT_W};
+use vvbook_security::FOLIO_RELEASE_PUBKEY;
 use vvbook_userspace::FolioApp;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -47,10 +48,12 @@ impl EmuRuntime {
         let mut sink = EmuDisplaySink::new();
         let mut sensors = EmuSensors::default();
         let mut power = EmuPower::default();
-        let mut portal = match LivePortalServer::bind(vvdrop_bind, [0u8; 32], 1) {
+        let mut portal = match LivePortalServer::bind(vvdrop_bind, FOLIO_RELEASE_PUBKEY, 1) {
             Ok(p) => p,
-            Err(_) if allow_ephemeral_fallback => LivePortalServer::bind("127.0.0.1:0", [0u8; 32], 1)
-                .map_err(|e| format!("portal bind fallback: {e}"))?,
+            Err(_) if allow_ephemeral_fallback => {
+                LivePortalServer::bind("127.0.0.1:0", FOLIO_RELEASE_PUBKEY, 1)
+                    .map_err(|e| format!("portal bind fallback: {e}"))?
+            }
             Err(e) => return Err(format!("portal bind {vvdrop_bind}: {e}")),
         };
         let mut entropy = HostEntropy::from_system();

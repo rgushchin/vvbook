@@ -7,6 +7,7 @@ pub mod buttons;
 pub mod epd;
 pub mod net_portal;
 pub mod pins;
+pub mod power;
 pub mod sd_fat32;
 pub mod sensors;
 
@@ -17,6 +18,7 @@ pub use net_portal::{
     SmoltcpPortalEngine, StreamingHttpConn, VVDROP_WEB_HTML, VvDropServerState,
     sanitize_book_filename,
 };
+pub use power::{ActivePowerGovernor, CpuPowerMode};
 pub use sd_fat32::{BlockDevice, Fat32Volume, SpiSdhcCard, format_fat32};
 pub use sensors::{Bq27220, Ds3231, Qmi8658};
 

@@ -124,30 +124,33 @@ fn read_u8(src: &[u8], pos: &mut usize) -> Result<u8, VvbError> {
 }
 
 fn read_u16(src: &[u8], pos: &mut usize) -> Result<u16, VvbError> {
-    if *pos + 2 > src.len() {
-        return Err(VvbError::Truncated);
-    }
+    let end = pos
+        .checked_add(2)
+        .filter(|&e| e <= src.len())
+        .ok_or(VvbError::Truncated)?;
     let v = u16::from_le_bytes([src[*pos], src[*pos + 1]]);
-    *pos += 2;
+    *pos = end;
     Ok(v)
 }
 
 fn read_u32(src: &[u8], pos: &mut usize) -> Result<u32, VvbError> {
-    if *pos + 4 > src.len() {
-        return Err(VvbError::Truncated);
-    }
-    let v = u32::from_le_bytes(src[*pos..*pos + 4].try_into().unwrap());
-    *pos += 4;
+    let end = pos
+        .checked_add(4)
+        .filter(|&e| e <= src.len())
+        .ok_or(VvbError::Truncated)?;
+    let v = u32::from_le_bytes(src[*pos..end].try_into().unwrap());
+    *pos = end;
     Ok(v)
 }
 
 fn read_str(src: &[u8], pos: &mut usize) -> Result<String, VvbError> {
-    let len = read_u32(src, pos)? as usize;
-    if *pos + len > src.len() {
-        return Err(VvbError::Truncated);
-    }
-    let s = core::str::from_utf8(&src[*pos..*pos + len]).map_err(|_| VvbError::Corrupted)?;
-    *pos += len;
+    let len = usize::try_from(read_u32(src, pos)?).map_err(|_| VvbError::Truncated)?;
+    let end = pos
+        .checked_add(len)
+        .filter(|&e| e <= src.len())
+        .ok_or(VvbError::Truncated)?;
+    let s = core::str::from_utf8(&src[*pos..end]).map_err(|_| VvbError::Corrupted)?;
+    *pos = end;
     Ok(String::from(s))
 }
 
@@ -371,16 +374,25 @@ impl VvbBook {
 
     pub fn from_bytes(raw: &[u8]) -> Result<Self, VvbError> {
         let idx = VvbIndex::from_header_bytes(raw)?;
+        let max_blocks = raw.len() / 4;
+        if idx.block_count > max_blocks {
+            return Err(VvbError::Truncated);
+        }
         let mut blocks = Vec::with_capacity(idx.block_count);
-        let mut p = idx.block_stream_base as usize
-            + idx.block_checkpoints.first().copied().unwrap_or(0) as usize;
+        let cp0 = usize::try_from(idx.block_checkpoints.first().copied().unwrap_or(0))
+            .map_err(|_| VvbError::Truncated)?;
+        let mut p = usize::try_from(idx.block_stream_base)
+            .ok()
+            .and_then(|base| base.checked_add(cp0))
+            .ok_or(VvbError::Truncated)?;
         for _ in 0..idx.block_count {
-            let len = read_u32(raw, &mut p)? as usize;
-            if p + len > raw.len() {
-                return Err(VvbError::Truncated);
-            }
-            blocks.push(decode_block(&raw[p..p + len])?);
-            p += len;
+            let len = usize::try_from(read_u32(raw, &mut p)?).map_err(|_| VvbError::Truncated)?;
+            let end = p
+                .checked_add(len)
+                .filter(|&e| e <= raw.len())
+                .ok_or(VvbError::Truncated)?;
+            blocks.push(decode_block(&raw[p..end])?);
+            p = end;
         }
         Ok(Self {
             meta: idx.meta,
@@ -561,14 +573,18 @@ impl VvbIndex {
         let word_count = read_u32(hdr, &mut pos)?;
         let cover_w = read_u16(hdr, &mut pos)?;
         let cover_h = read_u16(hdr, &mut pos)?;
-        let cover_len = read_u32(hdr, &mut pos)? as usize;
-        if pos + cover_len > hdr.len() {
+        let cover_len = usize::try_from(read_u32(hdr, &mut pos)?).map_err(|_| VvbError::Truncated)?;
+        let cover_end = pos
+            .checked_add(cover_len)
+            .filter(|&e| e <= hdr.len())
+            .ok_or(VvbError::Truncated)?;
+        let cover_2bpp = hdr[pos..cover_end].to_vec();
+        pos = cover_end;
+
+        let toc_count = usize::try_from(read_u32(hdr, &mut pos)?).map_err(|_| VvbError::Truncated)?;
+        if toc_count > (hdr.len() - pos) / 8 {
             return Err(VvbError::Truncated);
         }
-        let cover_2bpp = hdr[pos..pos + cover_len].to_vec();
-        pos += cover_len;
-
-        let toc_count = read_u32(hdr, &mut pos)? as usize;
         let mut toc = Vec::with_capacity(toc_count);
         for _ in 0..toc_count {
             let t = read_str(hdr, &mut pos)?;
@@ -579,12 +595,17 @@ impl VvbIndex {
             });
         }
 
-        let block_count = read_u32(hdr, &mut pos)? as usize;
+        let block_count =
+            usize::try_from(read_u32(hdr, &mut pos)?).map_err(|_| VvbError::Truncated)?;
         let (checkpoint_shift, block_checkpoints) = if is_sparse {
             let shift = read_u8(hdr, &mut pos)?;
-            let cp_count = read_u32(hdr, &mut pos)? as usize;
+            let cp_count =
+                usize::try_from(read_u32(hdr, &mut pos)?).map_err(|_| VvbError::Truncated)?;
             if shift > 24 || cp_count > MAX_VVB_CHECKPOINTS {
                 return Err(VvbError::Corrupted);
+            }
+            if cp_count > (hdr.len() - pos) / 4 {
+                return Err(VvbError::Truncated);
             }
             let mut cps = Vec::with_capacity(cp_count);
             for _ in 0..cp_count {
@@ -592,6 +613,9 @@ impl VvbIndex {
             }
             (shift, cps)
         } else {
+            if block_count > (hdr.len() - pos) / 4 {
+                return Err(VvbError::Truncated);
+            }
             let mut shift = 0u8;
             while shift < 24 && block_count.div_ceil(1usize << shift) > MAX_VVB_CHECKPOINTS {
                 shift += 1;
@@ -997,12 +1021,13 @@ pub fn intern_language(s: &str) -> &'static str {
 }
 
 fn read_str_slice<'a>(src: &'a [u8], pos: &mut usize) -> Result<&'a str, VvbError> {
-    let len = read_u32(src, pos)? as usize;
-    if *pos + len > src.len() {
-        return Err(VvbError::Truncated);
-    }
-    let s = core::str::from_utf8(&src[*pos..*pos + len]).map_err(|_| VvbError::Corrupted)?;
-    *pos += len;
+    let len = usize::try_from(read_u32(src, pos)?).map_err(|_| VvbError::Truncated)?;
+    let end = pos
+        .checked_add(len)
+        .filter(|&e| e <= src.len())
+        .ok_or(VvbError::Truncated)?;
+    let s = core::str::from_utf8(&src[*pos..end]).map_err(|_| VvbError::Corrupted)?;
+    *pos = end;
     Ok(s)
 }
 
@@ -1139,8 +1164,13 @@ pub fn decode_layout_cache(raw: &[u8]) -> Result<Vec<PageAnchor>, VvbError> {
     if raw.len() < 8 || raw[0..4] != VVLC_MAGIC {
         return Err(VvbError::BadMagic);
     }
-    let count = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
-    if raw.len() != 8 + count * 6 {
+    let count = usize::try_from(u32::from_le_bytes(raw[4..8].try_into().unwrap()))
+        .map_err(|_| VvbError::Truncated)?;
+    let expected = count
+        .checked_mul(6)
+        .and_then(|n| n.checked_add(8))
+        .ok_or(VvbError::Truncated)?;
+    if raw.len() != expected {
         return Err(VvbError::Truncated);
     }
     let mut out = Vec::with_capacity(count);

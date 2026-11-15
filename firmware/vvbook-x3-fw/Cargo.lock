@@ -1397,6 +1397,7 @@ dependencies = [
 name = "vvbook-x3-fw"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "esp-alloc",
  "esp-hal",
  "esp-wifi",

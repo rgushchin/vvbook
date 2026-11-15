@@ -99,7 +99,7 @@ fn e2e_pdf_generation_cli_conversion_and_reader_layout() {
     let mut sensors = EmuSensors::default();
     let mut power = EmuPower::default();
     let mut portal = LivePortalServer::bind("127.0.0.1:0", [0u8; 32], 1).unwrap();
-    let mut ent = HostEntropy(42);
+    let mut ent = HostEntropy::from_seed_u64(42);
     let mut app = FolioApp::new();
     app.boot(&mut sink, &mut storage, &mut sensors, &mut power, &mut portal, &mut ent);
     assert_eq!(app.catalog.len(), 1);
@@ -138,7 +138,7 @@ fn e2e_live_tcp_vvdrop_lockout_and_multiformat_send() {
     let mut sensors = EmuSensors::default();
     let mut power = EmuPower::default();
     let mut portal = LivePortalServer::bind("127.0.0.1:0", [0u8; 32], 1).unwrap();
-    let mut ent = HostEntropy(1337);
+    let mut ent = HostEntropy::from_seed_u64(1337);
 
     let mut app = FolioApp::new();
     app.boot(&mut sink, &mut storage, &mut sensors, &mut power, &mut portal, &mut ent);
@@ -204,10 +204,14 @@ fn e2e_live_tcp_vvdrop_lockout_and_multiformat_send() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-fn post_ota_http(host_port: &str, body: &[u8]) -> u16 {
+fn post_ota_http(host_port: &str, body: &[u8], token: Option<&str>) -> u16 {
     let mut stream = TcpStream::connect(host_port).unwrap();
+    let tok_hdr = match token {
+        Some(t) => format!("X-VVDrop-Token: {t}\r\n"),
+        None => String::new(),
+    };
     let req = format!(
-        "POST /api/ota HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        "POST /api/ota HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{tok_hdr}Content-Length: {}\r\n\r\n",
         body.len()
     );
     stream.write_all(req.as_bytes()).unwrap();
@@ -225,26 +229,45 @@ fn post_ota_http(host_port: &str, body: &[u8]) -> u16 {
 
 #[test]
 fn e2e_ed25519_signed_ota_accept_tamper_and_rollback() {
+    use vvbook_cli::send_ota_over_http;
+    use vvbook_pal::NetworkPortal;
+
     let (sk, pk) = generate_ed25519_keypair().unwrap();
-    let portal = LivePortalServer::bind("127.0.0.1:0", pk, 2).unwrap();
+    let mut portal = LivePortalServer::bind("127.0.0.1:0", pk, 2).unwrap();
     let host_port = portal.addr().to_string();
 
     let payload_v2 = b"ESP32_C3_VVBOOK_FIRMWARE_IMAGE_V2_CLEAN_BYTES";
     let vvfw_v2 = sign_firmware_bytes(payload_v2, &sk, 2).unwrap();
 
-    // Valid v2 accepted -> 200 OK
-    assert_eq!(post_ota_http(&host_port, &vvfw_v2), 200);
+    // Closed portal must reject /api/ota with 503 Service Unavailable
+    assert_eq!(post_ota_http(&host_port, &vvfw_v2, None), 503);
+
+    // Start portal with an 8-digit pairing PIN; unauthenticated /api/ota must return 401
+    portal.start("48291704");
+    assert_eq!(post_ota_http(&host_port, &vvfw_v2, None), 401);
+
+    // PIN-authenticated OTA delivery via send_ota_over_http -> 200 OK
+    send_ota_over_http(&host_port, "48291704", &vvfw_v2).unwrap();
     let staged = portal.staged_ota().expect("v2 staged");
     assert_eq!(staged.0, 2);
     assert_eq!(staged.1.as_slice(), payload_v2);
+    let meta = portal.take_staged_ota().expect("take_staged_ota populated");
+    assert_eq!(meta.fw_version, 2);
+    assert_eq!(meta.payload_len, payload_v2.len() as u32);
 
-    // Flip 1 bit in signed payload -> rejected!
-    let mut tampered = vvfw_v2.clone();
+    // Flip 1 bit in signed v3 payload -> rejected!
+    let payload_v3 = b"ESP32_C3_VVBOOK_FIRMWARE_IMAGE_V3_CLEAN_BYTES";
+    let vvfw_v3 = sign_firmware_bytes(payload_v3, &sk, 3).unwrap();
+    let mut tampered = vvfw_v3.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 0x01;
-    assert!(post_ota_http(&host_port, &tampered) >= 400);
+    assert!(send_ota_over_http(&host_port, "48291704", &tampered).is_err());
 
     // Anti-rollback: valid signature for older v1 -> rejected!
     let vvfw_v1 = sign_firmware_bytes(b"OLD_V1_BINARY", &sk, 1).unwrap();
-    assert!(post_ota_http(&host_port, &vvfw_v1) >= 400);
+    assert!(send_ota_over_http(&host_port, "48291704", &vvfw_v1).is_err());
+
+    // Valid higher v3 after failures -> accepted!
+    send_ota_over_http(&host_port, "48291704", &vvfw_v3).unwrap();
+    assert_eq!(portal.take_staged_ota().unwrap().fw_version, 3);
 }
