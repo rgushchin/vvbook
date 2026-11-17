@@ -562,6 +562,10 @@ fn open_direct_epub<S: StorageBackend>(
     scratch: &mut ZipInflateScratch,
 ) -> Result<DirectBook, ParseError> {
     let zip = StorageZip::open(storage, path, file_size).map_err(|_| ParseError::InvalidArchive)?;
+    if crate::parsers::is_epub_drm_storage(storage, &zip, path, Some(scratch)) {
+        return Err(ParseError::UnsupportedFormat);
+    }
+    scratch.reset();
     let html_bytes = zip.text_uncomp_bytes();
 
     let opf_path = {

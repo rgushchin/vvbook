@@ -1100,8 +1100,105 @@ fn parse_epub_opf_meta(
     (title, author, language, spine_hrefs)
 }
 
+fn classify_epub_encryption_xml_drm(xml: &str) -> bool {
+    let lower = xml.to_ascii_lowercase();
+    if lower.contains("readium.org/2014/01/lcp") || lower.contains("ns.adobe.com/adept") {
+        return true;
+    }
+    let mut rest = lower.as_str();
+    while let Some(start) = rest.find("<encrypteddata") {
+        let after = &rest[start..];
+        let block = match after.find("</encrypteddata>") {
+            Some(end) => {
+                rest = &after[end + "</encrypteddata>".len()..];
+                &after[..end]
+            }
+            None => {
+                rest = "";
+                after
+            }
+        };
+        if block.contains("idpf.org/2008/embedding")
+            || block.contains("ns.adobe.com/pdf/enc#rc")
+            || block.contains("www.w3.org/2008/embedding")
+        {
+            continue;
+        }
+        if let Some(uri_pos) = block.find("uri=") {
+            let tail = &block[uri_pos + 4..];
+            let q = tail.as_bytes().first().copied().unwrap_or(b'"');
+            if (q == b'"' || q == b'\'')
+                && let Some(end_q) = tail[1..].find(q as char)
+            {
+                let uri = tail[1..1 + end_q].split('#').next().unwrap_or("");
+                if uri.ends_with(".xhtml")
+                    || uri.ends_with(".html")
+                    || uri.ends_with(".htm")
+                    || uri.ends_with(".xml")
+                    || uri.ends_with(".opf")
+                    || uri.ends_with(".ncx")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn is_epub_drm_in_memory(zip: &ZipArchive<'_>) -> bool {
+    for entry in zip.entries() {
+        let clean = entry.name.trim_start_matches("./");
+        if clean.eq_ignore_ascii_case("META-INF/rights.xml")
+            || clean.eq_ignore_ascii_case("META-INF/license.lcpl")
+            || clean.eq_ignore_ascii_case("META-INF/sinf.xml")
+        {
+            return true;
+        }
+    }
+    for entry in zip.entries() {
+        let clean = entry.name.trim_start_matches("./");
+        if clean.eq_ignore_ascii_case("META-INF/encryption.xml")
+            && let Ok(enc_bytes) = zip.read_meta(entry)
+        {
+            let (_, xml) = detect_and_decode_to_utf8(&enc_bytes, None);
+            if classify_epub_encryption_xml_drm(&xml) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn is_epub_drm_storage<S: StorageBackend>(
+    storage: &S,
+    zip: &StorageZip,
+    path: &str,
+    scratch: Option<&mut ZipInflateScratch>,
+) -> bool {
+    if zip.find_entry("META-INF/rights.xml").is_some()
+        || zip.find_entry("META-INF/license.lcpl").is_some()
+        || zip.find_entry("META-INF/sinf.xml").is_some()
+    {
+        return true;
+    }
+    if let Some(enc_meta) = zip.find_entry("META-INF/encryption.xml")
+        && let Ok(enc_raw) =
+            zip.read_entry_prefix_with_scratch(storage, path, enc_meta, 8192, scratch)
+    {
+        let (_, xml) = detect_and_decode_to_utf8(&enc_raw, None);
+        if classify_epub_encryption_xml_drm(&xml) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn parse_epub(raw: &[u8], filename: &str) -> Result<VvbBook, ParseError> {
     let zip = ZipArchive::parse(raw).map_err(|_| ParseError::InvalidArchive)?;
+    if is_epub_drm_in_memory(&zip) {
+        return Err(ParseError::UnsupportedFormat);
+    }
     let container = zip
         .read_entry("META-INF/container.xml")
         .map_err(|_| ParseError::MalformedDocument)?;
@@ -1841,6 +1938,10 @@ pub fn probe_book_storage_with_scratch<S: StorageBackend>(
                 }
                 None => owned_scratch.as_mut().expect("owned scratch initialized"),
             };
+            if is_epub_drm_storage(storage, &zip, path, Some(scratch)) {
+                return Err(ParseError::UnsupportedFormat);
+            }
+            scratch.reset();
             let opf_path = {
                 let c_raw = zip
                     .read_entry_prefix_with_scratch(storage, path, &c_meta, 4096, Some(scratch))
@@ -2769,6 +2870,10 @@ pub fn ingest_storage_to_vvb_with_progress<S: StorageBackend, F: FnMut(usize, us
         InputFormat::Epub => {
             let zip = StorageZip::open(sink.storage, source_path, file_size)
                 .map_err(|_| ParseError::InvalidArchive)?;
+            if is_epub_drm_storage(sink.storage, &zip, source_path, None)
+            {
+                return Err(ParseError::UnsupportedFormat);
+            }
             let file_size_u64 = zip.file_size();
             let c_raw = {
                 let c_meta = zip

@@ -72,8 +72,13 @@ pub fn is_valid_library_dir(dir: &str) -> bool {
             | "lost.dir"
             | "__macosx"
             | "crosspoint"
+            | "xtcache"
             | "koreader"
             | "sleep"
+            | "fonts"
+            | "screenshots"
+            | "wallpaper"
+            | "wallpapers"
             | "trash"
             | ".trashes"
             | "android"
@@ -117,6 +122,7 @@ pub fn is_valid_library_book_path(path: &str) -> bool {
                     | "wpsettings.dat"
                     | "metadata.opf"
                     | "metadata_db_prefs_backup.json"
+                    | "ofl.txt"
             ) || lower == "my clippings.txt"
                 || (lower.starts_with("my clippings") && lower.ends_with(".txt"))
             {
@@ -1013,6 +1019,46 @@ impl FolioApp {
         }
         drop(zip_scratch);
         drop(by_sibling);
+        if added > 0 && self.catalog.len() > 1 {
+            let active_id = self.catalog.get(self.active_book_idx).map(|c| c.id_hex.clone());
+            fn strip_art(t: &str) -> &str {
+                let t = t.trim();
+                for p in ["The ", "the ", "A ", "a ", "An ", "an "] {
+                    if let Some(rest) = t.strip_prefix(p) {
+                        return rest.trim();
+                    }
+                }
+                t
+            }
+            let cmp_ci = |a: &str, b: &str| -> core::cmp::Ordering {
+                let mut ia = a.chars().map(|c| c.to_ascii_lowercase());
+                let mut ib = b.chars().map(|c| c.to_ascii_lowercase());
+                loop {
+                    match (ia.next(), ib.next()) {
+                        (Some(ca), Some(cb)) => match ca.cmp(&cb) {
+                            core::cmp::Ordering::Equal => continue,
+                            ord => return ord,
+                        },
+                        (None, Some(_)) => return core::cmp::Ordering::Less,
+                        (Some(_), None) => return core::cmp::Ordering::Greater,
+                        (None, None) => return core::cmp::Ordering::Equal,
+                    }
+                }
+            };
+            self.catalog.sort_unstable_by(|a, b| {
+                let sa = a.author.split_whitespace().last().unwrap_or(&a.author);
+                let sb = b.author.split_whitespace().last().unwrap_or(&b.author);
+                cmp_ci(sa, sb)
+                    .then_with(|| cmp_ci(&a.author, &b.author))
+                    .then_with(|| cmp_ci(strip_art(&a.title), strip_art(&b.title)))
+                    .then_with(|| a.source_path.cmp(&b.source_path))
+            });
+            if let Some(id) = active_id
+                && let Some(pos) = self.catalog.iter().position(|c| c.id_hex == id)
+            {
+                self.active_book_idx = pos;
+            }
+        }
         self.catalog.shrink_to_fit();
 
         if self.active_book_idx >= self.catalog.len() {
@@ -1810,11 +1856,13 @@ impl FolioApp {
             let layout = layout_page_slice(&self.direct_section_blocks, anchor, &self.typo);
             self.current_layout = Some(layout);
             let disp_page = self.display_page_num() as u32;
+            let est_total = self.estimated_total_pages() as u32;
             let sec_packed = ((self.direct_section_idx as u32) << DIRECT_SEC_SHIFT)
                 | anchor.block_idx.min(255);
             if let Some(c) = self.catalog.get_mut(self.active_book_idx) {
                 c.last_block = sec_packed;
                 c.last_word = anchor.word_offset;
+                c.total_pages_cached = est_total;
                 c.current_page_cached = disp_page;
             }
             return;

@@ -136,6 +136,10 @@ fn is_text_book_entry(name: &str) -> bool {
 fn is_essential_zip_meta(name: &str) -> bool {
     let clean = name.trim_start_matches("./");
     clean.eq_ignore_ascii_case("META-INF/container.xml")
+        || clean.eq_ignore_ascii_case("META-INF/encryption.xml")
+        || clean.eq_ignore_ascii_case("META-INF/rights.xml")
+        || clean.eq_ignore_ascii_case("META-INF/license.lcpl")
+        || clean.eq_ignore_ascii_case("META-INF/sinf.xml")
         || ends_with_ascii_ci(clean, ".opf")
         || ends_with_ascii_ci(clean, ".ncx")
         || ends_with_ascii_ci(clean, ".fb2")
